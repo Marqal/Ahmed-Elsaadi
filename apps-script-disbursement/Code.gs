@@ -1,9 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.3            ║
+ * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.4            ║
  * ║  STANDALONE script — separate from the audit-monitoring script.            ║
  * ║  v1.3: paginate until empty page (was stopping at ~200 due to data.total);  ║
  * ║        broaden «مورد الصرف» detection + «🔍 فحص عيّنة» debug dump.            ║
+ * ║  v1.4: FIX data-loss — the sheet went empty on a server-error/timeout because ║
+ * ║        write cleared BEFORE setValues. Now atomic-safe (overwrite, no clear, ║
+ * ║        chunked + retried) and invoices are persisted BEFORE plate enrichment.║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
  * الهدف: يسحب فواتير التكلفة B2B بالجملة (مثلاً كل المسددة لسنة 2026، أو غير المسددة)
@@ -310,6 +313,43 @@ function deepFindName_(obj, re, depth) {
   return '';
 }
 
+/* ════════════════════════════ SAFE WRITE (no data loss) ════════════════════════════
+ * ── FIX v1.4: the old write cleared the sheet BEFORE setValues, so a transient
+ * Google "server error" (or a timeout on the big full-year run) left the sheet
+ * EMPTY. safeWrite_ never clears first: it OVERWRITES the data region and pads the
+ * removed tail with blanks in a single (chunked) pass, with retries. If it fails,
+ * the previous data survives. */
+function retry_(fn, tries) {
+  tries = tries || 3; let last;
+  for (let a = 0; a < tries; a++) { try { return fn(); } catch (e) { last = e; if (a < tries - 1) Utilities.sleep(1200 * (a + 1)); } }
+  throw last;
+}
+
+/** Overwrite rows [2..] with valuesRows, padding the removed tail with blanks.
+ *  opts: {amountCol, bgRows} — bgRows is a same-length array of background rows. */
+function safeWrite_(sh, valuesRows, cols, opts) {
+  opts = opts || {};
+  const n = valuesRows.length;
+  const oldRows = Math.max(sh.getLastRow() - 1, 0);
+  const total = Math.max(n, oldRows);
+  if (!total) return;
+  const blank = new Array(cols).fill('');
+  retry_(() => sh.getRange(2, 1, total, cols).setNumberFormat('@'), 2);
+  if (opts.amountCol != null) retry_(() => sh.getRange(2, opts.amountCol + 1, total, 1).setNumberFormat('0.00'), 2);
+  const CHUNK = 5000;
+  for (let start = 0; start < total; start += CHUNK) {
+    const len = Math.min(CHUNK, total - start);
+    const slice = [];
+    for (let i = 0; i < len; i++) { const gi = start + i; slice.push(gi < n ? valuesRows[gi] : blank); }
+    retry_(() => sh.getRange(2 + start, 1, len, cols).setValues(slice), 3);
+    if (opts.bgRows) {
+      const bgSlice = [];
+      for (let i = 0; i < len; i++) { const gi = start + i; bgSlice.push(gi < n ? opts.bgRows[gi] : new Array(cols).fill('#ffffff')); }
+      try { sh.getRange(2 + start, 1, len, cols).setBackgrounds(bgSlice); } catch (e) { /* color is cosmetic */ }
+    }
+  }
+}
+
 /* ════════════════════════════ PLATE CACHE (persistent, resumable) ════════════════════════════ */
 const PlateCache = {
   _map: null,
@@ -330,12 +370,7 @@ const PlateCache = {
   save() {
     const sh = this.sheet_();
     const ids = Object.keys(this._map);
-    const prev = Math.max(sh.getLastRow() - 1, 0);
-    if (prev) sh.getRange(2, 1, prev, 2).clearContent();
-    if (ids.length) {
-      const rng = sh.getRange(2, 1, ids.length, 2); rng.setNumberFormat('@');
-      rng.setValues(ids.map(id => [Util.safeText(id), Util.safeText(this._map[id])]));
-    }
+    safeWrite_(sh, ids.map(id => [Util.safeText(id), Util.safeText(this._map[id])]), 2);   // no clear-first
   }
 };
 
@@ -360,16 +395,10 @@ const DataTable = {
   },
   write(rows) {
     const sh = this.sheet_();
-    const prev = Math.max(sh.getLastRow() - 1, 0);
-    if (prev) { const rg = sh.getRange(2, 1, prev, DATA_COLS); rg.clearContent(); rg.setBackground(null); }
-    if (!rows.length) return;
-    const rng = sh.getRange(2, 1, rows.length, DATA_COLS);
-    rng.setNumberFormat('@');                                   // text first (dates stay ISO text)
-    sh.getRange(2, DI.AMOUNT + 1, rows.length, 1).setNumberFormat('0.00');   // amount numeric for Looker
-    rng.setValues(rows.map(r => r.map((v, ci) => ci === DI.AMOUNT ? (v === '' || v == null ? '' : Number(v)) : Util.safeText(v))));
-    const bg = rows.map(r => Array(DATA_COLS).fill(
+    const values = rows.map(r => r.map((v, ci) => ci === DI.AMOUNT ? (v === '' || v == null ? '' : Number(v)) : Util.safeText(v)));
+    const bgRows = rows.map(r => Array(DATA_COLS).fill(
       !String(r[DI.PLATE] || '').trim() ? CFG.C_ORG : (String(r[DI.MATCH]).indexOf('⚠️') > -1 ? CFG.C_ORG : CFG.C_EVEN)));
-    rng.setBackgrounds(bg);
+    safeWrite_(sh, values, DATA_COLS, { amountCol: DI.AMOUNT, bgRows });   // atomic-safe (no clear-first)
   }
 };
 
@@ -421,9 +450,12 @@ function syncDisbursementData() {
       row[DI.UPDATED] = now;
     });
 
-    // 3) enrich plates (cached, time-boxed)
-    enrichPlates_(data, cache, cfg, t0 + CFG.SOFT_TIME_LIMIT_MS);
+    // 3) persist the invoices NOW (before the slow plate enrichment) so the data
+    //    survives even if enrichment/plate-fetch is cut short by a timeout.
+    DataTable.write(data.rows);
 
+    // 4) enrich plates (cached, time-boxed), then persist again with the plates.
+    enrichPlates_(data, cache, cfg, t0 + CFG.SOFT_TIME_LIMIT_MS);
     DataTable.write(data.rows);
     PlateCache.save(cache);
 
