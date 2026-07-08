@@ -1,48 +1,49 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  نظام مراقبة الفواتير — مسمار  v8.1  (restructure + delivery analytics)     ║
+ * ║  نظام مراقبة الفواتير — مسمار  v8.2  (one-row log + delivery-based AHT)      ║
  * ║  Invoice Audit Monitoring System                                          ║
- * ║  Built on top of v8.0 by Ahmed Elsaadi · feature update                   ║
+ * ║  Built on top of v8.x by Ahmed Elsaadi · feedback update                  ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * ════════════════ WHAT CHANGED vs v8.0 (this update) ════════════════
+ * ════════════════ WHAT CHANGED vs v8.1 (this update, per feedback) ════════════════
  *
- * (1) SHEET RESTRUCTURE — three status tabs instead of two:
- *       • "الطلبات تم التسليم"  (Delivered Orders)  → ONLY status «تم التسليم».
- *       • "الطلبات الجاهزة"     (Ready Orders)      → ready/auditable but NOT yet delivered.
- *       • "طلبات أخرى"          (Other Orders)      → every remaining status.
- *     The old single «الطلبات غير الجاهزة» tab is auto-migrated to «طلبات أخرى».
- *     New classifier classifyOrder_() returns one of: delivered | ready | other.
+ * THE WORKFLOW (as clarified):
+ *   Order becomes «تم التسليم» → it enters the audit queue → the auditor adds a
+ *   «مورد الصرف» (disbursement supplier) → the invoice is settled and the order
+ *   LEAVES the queue. So: supplier-added == completion, and the handling time we
+ *   care about is  «تم التسليم» → «مورد الصرف».  AHT therefore starts at delivery.
  *
- * (2) INVOICE / COST DATE TRACKING — capture WHEN the cost-invoice was created
- *     (NOT the order creation date). resolveCostDate_() prefers the API's
- *     invoice.createdAt (system input time); if absent it falls back to the
- *     moment our sheet first saw the invoice (sheet-addition time, persisted in
- *     the hidden state sheet as firstSeenAt). Surfaced as a new column on the
- *     main sheet + all three status tabs + the activity log.
+ * (1) ACTIVITY LOG IS NOW ONE ROW PER ORDER (upsert / update-in-place).
+ *     Instead of many rows per order (entered / status-change / settled …), every
+ *     order occupies a SINGLE row whose milestone cells fill in over time:
+ *       وقت الجاهزية · وقت التسليم · وقت إضافة مورد الصرف · مدة المعالجة · الحالة.
+ *     This keeps the log compact so reports are usable. Old multi-row logs are
+ *     auto-migrated (collapsed per order) on first access. See ActivityLog.*.
  *
- * (3) DASHBOARD REWRITE — fully batched writes (a handful of setValues/
- *     setBackgrounds calls instead of hundreds of per-cell calls → much faster
- *     load). Richer KPI cards (delivered today, SLA %, avg handling time) and a
- *     redesigned «أداء المشرفين» block that now shows delivered-today, supplier-
- *     add count and average handling time per supervisor.
+ * (2) «وقت إضافة مورد الصرف» NOW POPULATES. It is captured at settlement (when the
+ *     order leaves the queue) from the order detail, and the handling minutes are
+ *     computed as businessMinutes(deliveredAt → supplierAddedAt).
  *
- * (4) DELIVERED-ORDER ANALYTICS + SUPERVISOR PERFORMANCE — for delivered orders
- *     we now capture:
- *        a. the exact timestamp the «مورد الصرف» (disbursement supplier) was added
- *           (extractDeliveryInfo_ scans statusesTracking + a dedicated field).
- *        b. the handling time = business-minutes from the chosen milestone
- *           (default: supplier-added) until completion (delivery).
- *     Both are written to the structured activity log (2 new columns) and rolled
- *     up into «أداء المشرفين» + the dashboard + the weekly/monthly reports.
+ * (3) AHT STARTS ONLY AT «تم التسليم». computeMetric_() counts business minutes
+ *     from the delivered timestamp for delivered orders only; ready/other orders
+ *     are never counted.
+ *
+ * (4) DELIVERED TAB no longer has a «مورد الصرف» column (it would always be empty
+ *     there, since adding the supplier removes the order from the queue). It now
+ *     shows delivered-time + live handling since delivery.
+ *
+ * (5) DASHBOARD and «أداء المشرفين» sheets were REMOVED. A new «الأداء اليومي»
+ *     tab replaces them with exactly the daily metrics requested:
+ *       المشرف · إجمالي المسند · تم التسليم (قيد الإنجاز) · أنجز اليوم · متوسط المعالجة اليوم.
+ *
+ * (6) NEW «📆 تقرير حسب التاريخ (من - إلى)» menu item builds a report for any date
+ *     range from the one-row log. Weekly/monthly reports reuse the same engine.
  *
  * ════════════════ VERIFY THESE AGAINST YOUR LIVE API ════════════════
- *  The mismar API response shape is inferred (same caveat as v8.0). If delivery
- *  / supplier tracking shows «—», adjust these CONFIG knobs:
- *    • CFG.DELIVERED_STATUSES  — keyword(s) that mark an order as delivered.
- *    • CFG.SUPPLIER_KEYWORDS   — status-name keyword(s) for "supplier added".
- *    • CFG.SUPPLIER_FIELD_NAMES— order-detail object fields that hold the supplier.
- *    • CFG.HANDLING_FROM       — 'supplier' (default) or 'assign' milestone.
+ *   If the supplier/handling still shows «—», tune CFG.DELIVERED_STATUSES /
+ *   CFG.SUPPLIER_KEYWORDS / CFG.SUPPLIER_FIELD_NAMES. Supplier time falls back to
+ *   the order's last-action time at settlement, so the column should never be
+ *   mysteriously blank again.
  *
  * RUNTIME: V8 (default). Keep "runtimeVersion":"V8" in appsscript.json.
  */
@@ -52,23 +53,27 @@ const CFG = {
   // Sheet names
   SH_SET:      'الاعدادات',
   SH_MAIN:     'الطلبات',
-  SH_DELIVERED:'الطلبات تم التسليم',        // ── CHANGE v8.1: NEW dedicated delivered tab
-  SH_READY:    'الطلبات الجاهزة',           // ready but NOT delivered
-  SH_OTHER:    'طلبات أخرى',                // ── CHANGE v8.1: NEW "other statuses" tab
-  SH_NOTREADY: 'الطلبات غير الجاهزة',       // legacy name (auto-migrated → SH_OTHER)
+  SH_DELIVERED:'الطلبات تم التسليم',
+  SH_READY:    'الطلبات الجاهزة',
+  SH_OTHER:    'طلبات أخرى',
+  SH_NOTREADY: 'الطلبات غير الجاهزة',       // legacy (auto-migrated → SH_OTHER)
   SH_SUMMARY:  'اجمالي المراكز',
-  SH_PERF:     'اداء المشرفين',
+  SH_DAILY:    'الأداء اليومي',             // ── CHANGE v8.2: NEW daily performance tab
   SH_MATRIX:   'Invoice Audit Assignment Matrix',
   SH_LEAVES:   'قائمة الاجازات',
-  SH_DASH:     'الداش بورد',
-  SH_AUDIT:    'سجل النشاط',
-  SH_AUDIT_ARC:'سجل النشاط - ارشيف',
+  SH_LOG:      'سجل النشاط',                // now: ONE ROW PER ORDER
+  SH_LOG_ARC:  'سجل النشاط - ارشيف',
+  SH_LOG_OLD:  'سجل النشاط - قديم',         // ── CHANGE v8.2: parked pre-migration log
   SH_SEARCH:   'بحث النشاط',
   SH_LOG_W:    'لوج اسبوعي',
   SH_LOG_M:    'لوج شهري',
-  SH_STATE:    '__mismar_state',
+  SH_RANGE:    'تقرير حسب التاريخ',         // ── CHANGE v8.2: custom range report output
+  // REMOVED in v8.2: SH_DASH ('الداش بورد'), SH_PERF ('اداء المشرفين'), SH_STATE.
+  SH_DASH_OLD: 'الداش بورد',
+  SH_PERF_OLD: 'اداء المشرفين',
+  SH_STATE_OLD:'__mismar_state',
 
-  // Settings cells (legacy / fallback)
+  // Settings cells
   CELL_TOKEN:'B2', CELL_AHT:'B3', CELL_SHIFT_S:'B4', CELL_SHIFT_E:'B5', CELL_TZ:'B6',
 
   // Defaults
@@ -80,35 +85,22 @@ const CFG = {
   INV_LIMIT:100, MAX_PAGES:50,
   FETCH_CHUNK:25,
   SOFT_TIME_LIMIT_MS:4.5*60*1000,
+  MAX_SETTLE_LOOKUPS:120,   // cap the per-run settlement detail fetches
 
-  // ── CHANGE v8.1: status buckets are now explicit so we can split into 3 tabs.
-  // An order is DELIVERED if its status name contains any of these:
+  // Status buckets
   DELIVERED_STATUSES:['تم التسليم','تم التسليم بنجاح','delivered'],
-  // ...else READY (auditable) if it contains any of these:
-  READY_STATUSES:['جاهز','مكتمل','جاهزة','completed','ready','تم التدقيق'],
-  // ...else it falls into "Other".
+  READY_STATUSES:['جاهز','جاهزة','مكتمل','completed','ready','تم التدقيق'],
 
-  // If your workflow assigns the order at a specific status, add a keyword here
-  // and AHT will start from that status's timestamp (else invoice.createdAt):
-  ASSIGN_KEYWORDS:[],
-
-  // ── CHANGE v8.1: "مورد الصرف" (disbursement supplier) detection.
-  // We look for a status-tracking entry whose name contains one of these:
+  // «مورد الصرف» (disbursement supplier) detection at settlement
   SUPPLIER_KEYWORDS:['مورد الصرف','اضافة مورد الصرف','إضافة مورد الصرف','تم اضافة المورد','disbursement supplier'],
-  // ...and/or a dedicated field on the order-detail object named one of these:
   SUPPLIER_FIELD_NAMES:['disbursementSupplier','costInvoiceSupplier','spendSupplier','supplier'],
-  // Milestone the handling-time is measured FROM: 'supplier' (مورد الصرف) or 'assign'.
-  HANDLING_FROM:'supplier',
 
-  // Main sheet columns (── CHANGE v8.1: added COST = invoice/cost creation time)
-  CM:{LOC:1,OID:2,IID:3,P1:4,P2:5,ACTIVE:6,STATUS:7,READY:8,DONE:9,ASSIGN:10,DUR:11,DELAY:12,COST:13,COLS:13},
+  // Main sheet columns
+  CM:{LOC:1,OID:2,IID:3,P1:4,P2:5,ACTIVE:6,STATUS:7,READY:8,DONE:9,DELIVERED:10,DUR:11,DELAY:12,COST:13,COLS:13},
 
-  // ── CHANGE v8.1: activity log widened 11 → 13 (cost time + supplier time).
-  AUDIT_COLS:13,
-
-  // Audit log retention
-  AUDIT_MAX:5000,
-  STATE_PRUNE_DAYS:14,
+  // Log retention
+  LOG_MAX:8000,            // one row per order → grows slowly
+  ARCHIVE_DAYS:30,         // completed orders older than this are archived
 
   // Colors
   C_HDR:'#0d1b2a', C_RED:'#fce8e6', C_GRN:'#e6f4ea', C_YEL:'#fff8e1',
@@ -116,12 +108,16 @@ const CFG = {
   C_ODD:'#f8f9fa', C_EVEN:'#ffffff', C_TEAL:'#e0f2f1'
 };
 
-// ── CHANGE v8.1: single source of truth for the (now 13-column) activity log.
-const AUDIT_HEADERS = [
-  'الوقت', 'المصدر', 'نوع الإجراء', 'رقم الاوردر', 'رقم الفاتورة',
-  'المركز', 'من حالة', 'إلى حالة', 'المنفّذ', 'مدة المعالجة (دقائق)',
-  'وقت إضافة الفاتورة', 'وقت إضافة مورد الصرف', 'ملاحظة'
+// ── CHANGE v8.2: the log is now order-keyed. These are its (0-based) columns.
+const LG = { OID:0, IID:1, LOC:2, ACTIVE:3, STATUS:4, COST:5, FIRST:6, READY:7, DELIVERED:8, SUPPLIER:9, MINS:10, STATE:11, UPDATED:12 };
+const LOG_COLS = 13;
+const LOG_HEADERS = [
+  'رقم الاوردر', 'رقم الفاتورة', 'المركز', 'المسؤول', 'الحالة الحالية',
+  'وقت إضافة الفاتورة', 'وقت الدخول للطابور', 'وقت الجاهزية', 'وقت التسليم',
+  'وقت إضافة مورد الصرف', 'مدة المعالجة (دقائق)', 'الحالة', 'آخر تحديث'
 ];
+const ST_QUEUE = 'قيد الطابور';
+const ST_DONE  = 'مكتمل';
 
 class AuthError extends Error {
   constructor(code){ super('AUTH_' + code); this.name = 'AuthError'; this.code = code; }
@@ -145,16 +141,12 @@ function getConfig_() {
     shiftEnd: Number.isFinite(se_) ? se_ : CFG.DEF_SE,
     tz: read(CFG.CELL_TZ, CFG.DEF_TZ),
     readyStatuses: CFG.READY_STATUSES,
-    deliveredStatuses: CFG.DELIVERED_STATUSES,   // ── CHANGE v8.1
-    supplierKeywords: CFG.SUPPLIER_KEYWORDS,     // ── CHANGE v8.1
-    supplierFields: CFG.SUPPLIER_FIELD_NAMES,    // ── CHANGE v8.1
-    handlingFrom: CFG.HANDLING_FROM,             // ── CHANGE v8.1
-    assignKeywords: CFG.ASSIGN_KEYWORDS
+    deliveredStatuses: CFG.DELIVERED_STATUSES,
+    supplierKeywords: CFG.SUPPLIER_KEYWORDS,
+    supplierFields: CFG.SUPPLIER_FIELD_NAMES
   };
 }
 
-/** Token is read from Script Properties first (secure), falling back to the
- *  legacy B2 cell so existing setups keep working. Use setToken() to migrate. */
 function getToken_(settingsSheet) {
   const p = PropertiesService.getScriptProperties().getProperty('MISMAR_TOKEN');
   if (p && p.trim().length > 30) return p.trim();
@@ -182,7 +174,6 @@ function setToken() {
 
 /* ════════════════════════════ UTIL ════════════════════════════ */
 const Util = {
-  /** Normalise a center name for fuzzy matching. */
   norm(name) {
     if (!name) return '';
     return String(name)
@@ -191,21 +182,20 @@ const Util = {
       .replace(/\s+/g, ' ').trim().toLowerCase();
   },
 
-  /** A Date at the given tz-local hour on refDate's day (DST-correct). */
   tzDateAtHour(refDate, tz, hour) {
     const ymd = Utilities.formatDate(refDate, tz, 'yyyy-MM-dd');
-    const z = Utilities.formatDate(refDate, tz, 'Z');         // e.g. +0300
+    const z = Utilities.formatDate(refDate, tz, 'Z');
     const hh = ('0' + hour).slice(-2);
     return new Date(`${ymd}T${hh}:00:00${z.slice(0, 3)}:${z.slice(3)}`);
   },
 
-  /** Business minutes between two Dates, counting only [shiftStart, shiftEnd)
-   *  each day in tz. O(days), capped at 60 business days. */
+  /** Business minutes between two Dates, counting only [shiftStart, shiftEnd) each
+   *  day in tz. O(days), capped at 60 business days. */
   businessMinutes(start, end, shiftStart, shiftEnd, tz) {
     if (!(start instanceof Date) || !(end instanceof Date)) return 0;
     let s = start.getTime(), e = end.getTime();
     if (isNaN(s) || isNaN(e) || !(e > s)) return 0;
-    if (shiftEnd <= shiftStart) return Math.round((e - s) / 60000);  // 24h/overnight fallback
+    if (shiftEnd <= shiftStart) return Math.round((e - s) / 60000);
 
     let totalMs = 0, guard = 0, cursor = new Date(s);
     const MAX_DAYS = 60;
@@ -229,18 +219,23 @@ const Util = {
     return (h > 0 ? h + 'س ' : '') + m + 'د';
   },
 
+  /** Format any Date/ISO into "yyyy-MM-dd HH:mm" in tz (also the log's stored form). */
   fmtDt(value, tz) {
-    if (!value) return '—';
+    if (!value) return '';
     try {
       const d = value instanceof Date ? value : new Date(value);
       if (isNaN(d)) return String(value).replace('T', ' ').substr(0, 16);
       return Utilities.formatDate(d, tz, 'yyyy-MM-dd HH:mm');
-    } catch (e) { return '—'; }
+    } catch (e) { return ''; }
   },
+
+  dash(v) { return (v === '' || v === null || v === undefined) ? '—' : v; },
+
+  todayStr(tz) { return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd'); },
+  daysAgoStr(tz, n) { return Utilities.formatDate(new Date(Date.now() - n * 86400000), tz, 'yyyy-MM-dd'); },
 
   nowIso() { return new Date().toISOString(); },
 
-  /** Coerce to a string Sheets cannot interpret as a formula (anti-injection). */
   safeText(v) {
     if (v === null || v === undefined) return '';
     const s = String(v);
@@ -260,7 +255,6 @@ const Api = {
     };
   },
 
-  /** All pending B2B cost invoices (every page). Throws AuthError on 401/403. */
   fetchAllInvoices(token) {
     const rows = [];
     for (let page = 1; page <= CFG.MAX_PAGES; page++) {
@@ -283,9 +277,7 @@ const Api = {
           loc: (i.purchaseLocation && i.purchaseLocation.name) ? i.purchaseLocation.name : 'غير محدد',
           orderId: i.orderId || (i.order && i.order.id) || null,
           invoiceId: i.id || null,
-          // ── CHANGE v8.1: this is the COST-INVOICE creation time (system input
-          // time), NOT the order creation date. Used by resolveCostDate_().
-          createdAt: i.createdAt || ''
+          createdAt: i.createdAt || ''    // cost-invoice creation time (system input time)
         });
       });
       if (raw.length < CFG.INV_LIMIT) break;
@@ -294,7 +286,6 @@ const Api = {
     return rows;
   },
 
-  /** Fetch many order details concurrently. Returns {orderId: detail|null}. */
   fetchOrderDetails(orderIds, token, softDeadline) {
     const out = {};
     let truncated = false;
@@ -319,7 +310,6 @@ const Api = {
     return out;
   },
 
-  /** Single order detail (used for accurate settlement timestamps). */
   fetchOrderDetail(orderId, token) {
     try {
       const r = UrlFetchApp.fetch(`${CFG.API_BASE}/adminApi/v1/orders/${orderId}`,
@@ -343,10 +333,7 @@ function parseOrderDetail_(text) {
     if (last.actionBy === -1) actor = 'النظام تلقائي';
     actionAt = last.updatedAt || last.createdAt || '';
   }
-
-  // ── CHANGE v8.1: best-effort dedicated "disbursement supplier" field. Some
-  // APIs expose the supplier as an object rather than a tracking status; we
-  // capture it here so extractDeliveryInfo_ can use it as a fallback.
+  // best-effort dedicated "disbursement supplier" field
   let supplierName = '', supplierAt = '', supplierBy = '';
   for (const f of CFG.SUPPLIER_FIELD_NAMES) {
     const sup = d[f];
@@ -357,7 +344,6 @@ function parseOrderDetail_(text) {
       if (supplierAt || supplierName) break;
     }
   }
-
   return { statusName, actor, actionAt, createdAt, tracking, supplierName, supplierAt, supplierBy };
 }
 
@@ -413,190 +399,253 @@ function matchLoc_(raw, matrix, normMap) {
   return bestScore > 0 ? best : raw;
 }
 
-/* ════════════════════════════ DOMAIN: classify / assign / metrics ════════════════════════════ */
-
-/** ── CHANGE v8.1: three-way classifier driving the new tab split.
- *  Returns { cat:'delivered'|'ready'|'other', delivered, ready, blocked, unknown }. */
+/* ════════════════════════════ DOMAIN: classify / delivery / metric ════════════════════════════ */
 function classifyOrder_(statusName, cfg) {
   if (!statusName || statusName === '—' || statusName === 'قيد التحديث') {
-    // Unknown / still-loading → parked in "Other", AHT paused.
-    return { cat: 'other', delivered: false, ready: false, blocked: true, unknown: true };
+    return { cat: 'other', delivered: false, ready: false, unknown: true };
   }
   if (cfg.deliveredStatuses.some(s => statusName.indexOf(s) !== -1)) {
-    return { cat: 'delivered', delivered: true, ready: true, blocked: false, unknown: false };
+    return { cat: 'delivered', delivered: true, ready: true, unknown: false };
   }
   if (cfg.readyStatuses.some(s => statusName.indexOf(s) !== -1)) {
-    return { cat: 'ready', delivered: false, ready: true, blocked: false, unknown: false };
+    return { cat: 'ready', delivered: false, ready: true, unknown: false };
   }
-  return { cat: 'other', delivered: false, ready: false, blocked: true, unknown: false };
+  return { cat: 'other', delivered: false, ready: false, unknown: false };
 }
 
-function resolveAssignAt_(detail, invoiceCreatedAt, cfg) {
-  if (detail && cfg.assignKeywords.length && detail.tracking && detail.tracking.length) {
-    for (const t of detail.tracking) {
-      const si = t.statusInfo || {};
-      const nm = si.internalStatusName || si.orderStatusName || '';
-      if (cfg.assignKeywords.some(k => nm.indexOf(k) !== -1)) return t.createdAt || t.updatedAt || invoiceCreatedAt;
-    }
-  }
-  return invoiceCreatedAt; // default: queue entry
-}
-
-/** ── CHANGE v8.1: capture the cost/invoice timestamp.
- *  Primary = the API's invoice.createdAt (system input time).
- *  Fallback = the moment our sheet first observed this invoice (firstSeenAt),
- *  so we always have *some* "added on" time even if the API omits it. */
-function resolveCostDate_(invoiceCreatedAt, prevState) {
-  if (invoiceCreatedAt) return { at: invoiceCreatedAt, source: 'النظام' };
-  if (prevState && prevState.firstSeenAt) return { at: prevState.firstSeenAt, source: 'الشيت' };
-  return { at: Util.nowIso(), source: 'الشيت' };
-}
-
-/** ── CHANGE v8.1: extract «مورد الصرف» (supplier) + delivery milestones and
- *  compute the agent's handling time (milestone → completion). */
+/** Extract the delivered timestamp + the «مورد الصرف» (supplier) timestamp from an
+ *  order detail. Supplier is best-effort; at settlement we also fall back to the
+ *  order's last-action time so a completion time is always available. */
 function extractDeliveryInfo_(detail, cfg) {
-  const info = { deliveredAt: '', deliveredBy: '—', supplierAddedAt: '', supplierAddedBy: '—', supplierName: '', handlingMins: null };
+  const info = { deliveredAt: '', deliveredBy: '—', supplierAddedAt: '', supplierAddedBy: '—', supplierName: '' };
   if (!detail) return info;
-
   const tracking = Array.isArray(detail.tracking) ? detail.tracking : [];
   tracking.forEach(t => {
     const si = t.statusInfo || {};
     const nm = si.internalStatusName || si.orderStatusName || '';
     const at = t.updatedAt || t.createdAt || '';
     const who = (t.actionBy === -1) ? 'النظام تلقائي' : ((t.creator && t.creator.name) ? t.creator.name : '—');
-    // delivered → keep the LAST delivered timestamp (the actual completion).
     if (cfg.deliveredStatuses.some(k => nm.indexOf(k) !== -1)) { info.deliveredAt = at; info.deliveredBy = who; }
-    // supplier added → keep the FIRST occurrence (when it entered handling).
     if (!info.supplierAddedAt && cfg.supplierKeywords.some(k => nm.indexOf(k) !== -1)) {
       info.supplierAddedAt = at; info.supplierAddedBy = who; info.supplierName = nm;
     }
   });
-
-  // Fallback to a dedicated supplier field on the order detail.
   if (!info.supplierAddedAt && detail.supplierAt) {
-    info.supplierAddedAt = detail.supplierAt;
-    info.supplierAddedBy = detail.supplierBy || '—';
-    info.supplierName = detail.supplierName || '';
+    info.supplierAddedAt = detail.supplierAt; info.supplierAddedBy = detail.supplierBy || '—'; info.supplierName = detail.supplierName || '';
   }
-  // If still no explicit delivered status, use the last action timestamp.
-  if (!info.deliveredAt && detail.actionAt) { info.deliveredAt = detail.actionAt; info.deliveredBy = detail.actor || '—'; }
-
   return info;
 }
 
-/** Live metric for an OPEN invoice: elapsed business time vs the AHT target. */
-function liveMetric_(assignAt, blocked, cfg, nowMs) {
-  if (blocked) return { mins: null, dur: '—', breach: false, note: 'غير جاهزة — لا تُحتسب' };
-  const start = assignAt ? new Date(assignAt) : null;
-  if (!start || isNaN(start)) return { mins: null, dur: '—', breach: false, note: '—' };
-  const mins = Util.businessMinutes(start, new Date(nowMs), cfg.shiftStart, cfg.shiftEnd, cfg.tz);
-  const breach = mins > cfg.aht;
-  const over = mins - cfg.aht;
-  return { mins, dur: Util.fmtDuration(mins), breach, note: breach ? 'متأخر +' + Util.fmtDuration(over) : 'ضمن الهدف' };
+function resolveCostDisplay_(invIso, prevRow, cfg) {
+  if (invIso) return Util.fmtDt(invIso, cfg.tz);                 // system input time
+  if (prevRow && prevRow[LG.COST]) return String(prevRow[LG.COST]);
+  if (prevRow && prevRow[LG.FIRST]) return String(prevRow[LG.FIRST]);  // sheet first-seen fallback
+  return Util.fmtDt(new Date(), cfg.tz);
 }
 
-/* ════════════════════════════ STATE STORE (cross-run change detection) ════════════════════════════ */
-// ── CHANGE v8.1: widened 7 → 10 columns (added firstSeenAt, active, deliveredAt).
-const State = {
-  W: 10,
-  HEADERS: ['orderId','lastStatus','lastActionAt','assignAt','settled','settledAt','lastSeen','firstSeenAt','active','deliveredAt'],
-  sheet_() {
+/** ── CHANGE v8.2: AHT counts ONLY for delivered orders, from the delivered time. */
+function computeMetric_(rec, cfg, nowMs) {
+  if (rec.cat !== 'delivered') {
+    return { mins: null, dur: '—', breach: false, note: 'لا تُحتسب (غير مُسلّمة)' };
+  }
+  const start = rec.deliveredAt ? new Date(rec.deliveredAt) : null;
+  if (!start || isNaN(start)) return { mins: 0, dur: Util.fmtDuration(0), breach: false, note: 'بانتظار وقت التسليم' };
+  const mins = Util.businessMinutes(start, new Date(nowMs), cfg.shiftStart, cfg.shiftEnd, cfg.tz);
+  const breach = mins > cfg.aht;
+  return { mins, dur: Util.fmtDuration(mins), breach, note: breach ? 'متأخر +' + Util.fmtDuration(mins - cfg.aht) : 'ضمن الهدف' };
+}
+
+/* ════════════════════════════ ACTIVITY LOG — one row per order (upsert) ════════════════════════════ */
+const ActivityLog = {
+  /** Ensure the log sheet exists in the NEW order-keyed schema (migrating an old
+   *  multi-row log the first time it is seen). Returns the sheet. */
+  sheet() {
     const ss = SpreadsheetApp.getActive();
-    let sh = ss.getSheetByName(CFG.SH_STATE);
-    if (!sh) {
-      sh = ss.insertSheet(CFG.SH_STATE);
-      sh.getRange(1, 1, 1, this.W).setValues([this.HEADERS]);
-      sh.hideSheet();
+    let sh = ss.getSheetByName(CFG.SH_LOG);
+    if (!sh) { sh = ss.insertSheet(CFG.SH_LOG); this.writeHeader_(sh); return sh; }
+    // detect schema by A1
+    const a1 = sh.getLastColumn() >= 1 ? String(sh.getRange(1, 1).getValue()) : '';
+    if (a1 !== LOG_HEADERS[0]) {
+      try { this.migrateOld_(ss, sh); } catch (e) { console.warn('log migrate failed: ' + e); }
+      // guarantee a valid new-schema SH_LOG exists no matter how migration ended
+      sh = ss.getSheetByName(CFG.SH_LOG);
+      if (!sh) { sh = ss.insertSheet(CFG.SH_LOG); this.writeHeader_(sh); }
+      else if (String(sh.getRange(1, 1).getValue()) !== LOG_HEADERS[0]) this.resetTo_(sh);
     }
     return sh;
   },
-  load() {
-    const sh = this.sheet_();
-    const map = {};
-    if (sh.getLastRow() < 2) return map;
-    // Read W columns even on legacy 7-col sheets — Sheets returns '' for the extras.
-    sh.getRange(2, 1, sh.getLastRow() - 1, this.W).getValues().forEach(r => {
-      const id = String(r[0] || ''); if (!id) return;
-      map[id] = {
-        lastStatus: String(r[1] || ''), lastActionAt: String(r[2] || ''), assignAt: String(r[3] || ''),
-        settled: r[4] === true || r[4] === 'TRUE', settledAt: String(r[5] || ''), lastSeen: String(r[6] || ''),
-        firstSeenAt: String(r[7] || ''), active: String(r[8] || ''), deliveredAt: String(r[9] || '')
-      };
-    });
-    return map;
+
+  writeHeader_(sh) {
+    sh.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS])
+      .setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
+    sh.setFrozenRows(1);
+    [110, 110, 190, 160, 150, 150, 155, 150, 150, 165, 130, 110, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
   },
-  save(map) {
-    const sh = this.sheet_();
-    const cutoff = Date.now() - CFG.STATE_PRUNE_DAYS * 86400000;
-    const rows = Object.keys(map).filter(id => {
-      const s = map[id];
-      if (s.settled && s.settledAt) { const t = new Date(s.settledAt).getTime(); if (!isNaN(t) && t < cutoff) return false; }
-      return true;
-    }).map(id => {
-      const s = map[id];
-      return [id, s.lastStatus, s.lastActionAt, s.assignAt, !!s.settled, s.settledAt || '',
-              s.lastSeen || '', s.firstSeenAt || '', s.active || '', s.deliveredAt || ''];
+
+  resetTo_(sh) { sh.clear(); this.writeHeader_(sh); },
+
+  /** Collapse an OLD multi-row (action-based) log into ONE row per order. */
+  migrateOld_(ss, oldSheet) {
+    const lastRow = oldSheet.getLastRow(), lastCol = Math.max(oldSheet.getLastColumn(), 1);
+    const byOrder = {};
+    if (lastRow >= 2) {
+      const data = oldSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+      // old layout: [time, source, action, oid, iid, loc, from, to, actor, mins, (cost?), (supplier?), note]
+      data.forEach(r => {
+        const oid = String(r[3] || '').trim(); if (!oid) return;
+        const time = String(r[0] || ''), action = String(r[2] || ''), iid = String(r[4] || ''), loc = String(r[5] || ''),
+              actor = String(r[8] || ''), mins = r[9], toStatus = String(r[7] || '');
+        const o = byOrder[oid] || (byOrder[oid] = { iid: '', loc: '', actor: '', status: '', first: '', ready: '', delivered: '', supplier: '', mins: '', state: ST_QUEUE });
+        if (iid) o.iid = iid;
+        if (loc) o.loc = loc;
+        if (actor && actor !== '—' && actor !== 'النظام تلقائي') o.actor = actor;
+        if (toStatus) o.status = toStatus;
+        if (action.indexOf('طابور') > -1 && !o.first) o.first = time;
+        if (action.indexOf('جاهز') > -1 && !o.ready) o.ready = time;
+        if (action.indexOf('تسليم') > -1) { o.delivered = time; o.status = o.status || 'تم التسليم'; }
+        if (action.indexOf('تسوية') > -1) { o.supplier = time; o.state = ST_DONE; if (mins !== '' && mins != null) o.mins = mins; }
+      });
+    }
+    // park old sheet, create fresh new-schema sheet, write collapsed rows
+    try { if (!ss.getSheetByName(CFG.SH_LOG_OLD)) oldSheet.setName(CFG.SH_LOG_OLD); else oldSheet.setName(CFG.SH_LOG_OLD + ' ' + Utilities.formatDate(new Date(), CFG.DEF_TZ, 'MMdd-HHmm')); }
+    catch (e) {}
+    const sh = ss.insertSheet(CFG.SH_LOG);
+    this.writeHeader_(sh);
+    const rows = Object.keys(byOrder).map(oid => {
+      const o = byOrder[oid];
+      const out = new Array(LOG_COLS).fill('');
+      out[LG.OID] = oid; out[LG.IID] = o.iid; out[LG.LOC] = o.loc; out[LG.ACTIVE] = o.actor; out[LG.STATUS] = o.status;
+      out[LG.FIRST] = o.first; out[LG.READY] = o.ready; out[LG.DELIVERED] = o.delivered; out[LG.SUPPLIER] = o.supplier;
+      out[LG.MINS] = o.mins; out[LG.STATE] = o.state; out[LG.UPDATED] = o.supplier || o.delivered || o.first;
+      return out;
     });
-    sh.getRange(2, 1, Math.max(sh.getLastRow() - 1, 1), this.W).clearContent();
-    if (rows.length) sh.getRange(2, 1, rows.length, this.W).setValues(rows);
+    if (rows.length) sh.getRange(2, 1, rows.length, LOG_COLS).setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+    console.log(`log migrated → ${rows.length} order rows`);
+  },
+
+  /** Read the whole log into memory: {sheet, rows[][], idx{oid:pos}}. */
+  read() {
+    const sh = this.sheet();
+    const lastRow = sh.getLastRow();
+    const rows = lastRow >= 2 ? sh.getRange(2, 1, lastRow - 1, LOG_COLS).getValues() : [];
+    const idx = {};
+    rows.forEach((r, i) => { const id = String(r[0] || ''); if (id) idx[id] = i; });
+    return { sheet: sh, rows, idx };
+  },
+
+  prev(log, oid) { const p = log.idx[String(oid)]; return p != null ? log.rows[p] : null; },
+
+  /** Upsert current queue records, detect settlements (supplier added), archive
+   *  old completed rows, and write the whole thing back in one setValues. */
+  update(log, records, cfg) {
+    const now = Util.fmtDt(new Date(), cfg.tz);
+    const currentIds = new Set();
+
+    // (a) upsert the live queue
+    records.forEach(r => {
+      if (!r.orderId) return;
+      const id = String(r.orderId); currentIds.add(id);
+      let pos = log.idx[id], row;
+      if (pos == null) {
+        row = new Array(LOG_COLS).fill('');
+        row[LG.OID] = id; row[LG.FIRST] = now; row[LG.STATE] = ST_QUEUE;
+        log.rows.push(row); log.idx[id] = log.rows.length - 1;
+      } else row = log.rows[pos];
+
+      row[LG.IID] = r.invoiceId || row[LG.IID] || '';
+      row[LG.LOC] = r.loc || row[LG.LOC] || '';
+      row[LG.ACTIVE] = r.active || row[LG.ACTIVE] || '';
+      row[LG.STATUS] = r.status || row[LG.STATUS] || '';
+      if (!row[LG.COST] && r.costDisplay) row[LG.COST] = r.costDisplay;
+      if (!row[LG.READY] && (r.cat === 'ready' || r.cat === 'delivered')) row[LG.READY] = now;
+      if (!row[LG.DELIVERED] && r.cat === 'delivered') row[LG.DELIVERED] = r.deliveredAt ? Util.fmtDt(r.deliveredAt, cfg.tz) : now;
+      row[LG.STATE] = ST_QUEUE;
+      row[LG.UPDATED] = now;
+    });
+
+    // (b) settlement: rows still "قيد الطابور" but no longer in the queue ⇒ supplier
+    //     was added ⇒ completed. Capture supplier time + handling minutes.
+    let lookups = 0;
+    Object.keys(log.idx).forEach(id => {
+      if (currentIds.has(id)) return;
+      const row = log.rows[log.idx[id]];
+      if (!row || row[LG.STATE] === ST_DONE) return;
+      if (lookups >= CFG.MAX_SETTLE_LOOKUPS) return;  // defer the rest to the next run
+      lookups++;
+      const det = Api.fetchOrderDetail(id, cfg.token);
+      const di = det ? extractDeliveryInfo_(det, cfg) : null;
+      const completionIso = (di && di.supplierAddedAt) || (det && det.actionAt) || Util.nowIso();
+      const deliveredIso  = (di && di.deliveredAt) || '';
+      row[LG.SUPPLIER] = Util.fmtDt(completionIso, cfg.tz);
+      if (!row[LG.DELIVERED] && deliveredIso) row[LG.DELIVERED] = Util.fmtDt(deliveredIso, cfg.tz);
+      if (deliveredIso) row[LG.MINS] = Util.businessMinutes(new Date(deliveredIso), new Date(completionIso), cfg.shiftStart, cfg.shiftEnd, cfg.tz);
+      if (det && det.statusName && det.statusName !== '—') row[LG.STATUS] = det.statusName;
+      if (di && di.supplierAddedBy && di.supplierAddedBy !== '—') row[LG.ACTIVE] = row[LG.ACTIVE] || di.supplierAddedBy;
+      row[LG.STATE] = ST_DONE;
+      row[LG.UPDATED] = now;
+    });
+
+    // (c) archive completed rows older than ARCHIVE_DAYS (keeps the hot log small)
+    const cutoff = Util.daysAgoStr(cfg.tz, CFG.ARCHIVE_DAYS);
+    const keep = [], arch = [];
+    log.rows.forEach(r => {
+      const done = r[LG.STATE] === ST_DONE;
+      const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
+      if (done && dp && dp < cutoff) arch.push(r); else keep.push(r);
+    });
+    if (arch.length) this.archive_(arch);
+
+    // (d) write back (clear then one setValues; handles shrink from archiving)
+    const sh = log.sheet;
+    const prevRows = Math.max(sh.getLastRow() - 1, 0);
+    if (prevRows) { const rg = sh.getRange(2, 1, prevRows, LOG_COLS); rg.clearContent(); rg.setBackground(null); }
+    if (keep.length) {
+      sh.getRange(2, 1, keep.length, LOG_COLS)
+        .setValues(keep.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+      sh.getRange(2, 1, keep.length, LOG_COLS).setNumberFormat('@');
+      sh.getRange(2, LG.MINS + 1, keep.length, 1).setNumberFormat('0');
+      // subtle status coloring
+      const bg = keep.map(r => Array(LOG_COLS).fill(r[LG.STATE] === ST_DONE ? CFG.C_GRN : CFG.C_EVEN));
+      sh.getRange(2, 1, keep.length, LOG_COLS).setBackgrounds(bg);
+    }
+    console.log(`log: ${keep.length} rows (settled this run: ${lookups}, archived: ${arch.length})`);
+  },
+
+  archive_(rows) {
+    const ss = SpreadsheetApp.getActive();
+    let arc = ss.getSheetByName(CFG.SH_LOG_ARC);
+    if (!arc) { arc = ss.insertSheet(CFG.SH_LOG_ARC); arc.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]); arc.setFrozenRows(1); }
+    arc.getRange(arc.getLastRow() + 1, 1, rows.length, LOG_COLS)
+       .setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+  },
+
+  /** All log rows (live + archive) as arrays — used by reports/daily. */
+  allRows() {
+    const out = [];
+    const ss = SpreadsheetApp.getActive();
+    [CFG.SH_LOG, CFG.SH_LOG_ARC].forEach(name => {
+      const sh = ss.getSheetByName(name);
+      if (sh && sh.getLastRow() >= 2) out.push(...sh.getRange(2, 1, sh.getLastRow() - 1, LOG_COLS).getValues());
+    });
+    return out;
   }
 };
 
-/* ════════════════════════════ AUDIT LOG (activity tracking) ════════════════════════════ */
-function writeAuditHeader_(sh) {
-  sh.getRange(1, 1, 1, CFG.AUDIT_COLS).setValues([AUDIT_HEADERS])
-    .setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
-  sh.setFrozenRows(1);
-  [155, 80, 175, 110, 110, 190, 140, 140, 150, 120, 150, 150, 200].forEach((w, i) => sh.setColumnWidth(i + 1, w));
-}
-
-/** ── CHANGE v8.1: migrate a legacy 11-column log to the new 13-column schema
- *  by inserting the two new columns BEFORE the old «ملاحظة», preserving history. */
-function ensureAuditSchema_(sh) {
-  const lastCol = sh.getLastColumn();
-  if (lastCol >= CFG.AUDIT_COLS) return;                 // already migrated
-  const hdr = sh.getRange(1, 1, 1, Math.max(lastCol, 1)).getValues()[0];
-  // Legacy layout had «ملاحظة» as column 11.
-  if (hdr.length >= 11 && String(hdr[10]).indexOf('ملاحظة') > -1) {
-    sh.insertColumns(11, 2);                             // shifts old col11 (ملاحظة) → col13
-    sh.getRange(1, 11, 1, 2).setValues([[AUDIT_HEADERS[10], AUDIT_HEADERS[11]]])
-      .setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
-  } else {
-    // Unknown/older layout → just (re)write the full header row.
-    writeAuditHeader_(sh);
-  }
-}
-
-function auditSheet_() {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(CFG.SH_AUDIT);
-  if (!sh) { sh = ss.insertSheet(CFG.SH_AUDIT); writeAuditHeader_(sh); }
-  else ensureAuditSchema_(sh);
-  return sh;
-}
-
-/** Append structured rows; pads/truncates each row to AUDIT_COLS defensively. */
-function appendAudit_(rows) {
-  if (!rows || !rows.length) return;
-  const sh = auditSheet_();
-  const W = CFG.AUDIT_COLS;
-  const norm = rows.map(r => { const a = r.slice(0, W); while (a.length < W) a.push(''); return a; });
-  sh.getRange(sh.getLastRow() + 1, 1, norm.length, W).setValues(norm);
-}
-
-/** Keep the hot log bounded; move the oldest 30% to the archive sheet. */
-function rotateAuditIfNeeded_() {
-  const sh = auditSheet_();
-  const n = sh.getLastRow() - 1;
-  if (n <= CFG.AUDIT_MAX) return;
-  const moveCount = Math.floor(CFG.AUDIT_MAX * 0.3);
-  const ss = SpreadsheetApp.getActive();
-  let arc = ss.getSheetByName(CFG.SH_AUDIT_ARC);
-  if (!arc) { arc = ss.insertSheet(CFG.SH_AUDIT_ARC); arc.getRange(1, 1, 1, CFG.AUDIT_COLS).setValues([AUDIT_HEADERS]); arc.setFrozenRows(1); }
-  const block = sh.getRange(2, 1, moveCount, CFG.AUDIT_COLS).getValues();
-  arc.getRange(arc.getLastRow() + 1, 1, moveCount, CFG.AUDIT_COLS).setValues(block);
-  sh.deleteRows(2, moveCount);
-  console.log(`archived ${moveCount} audit rows`);
+/** Aggregate COMPLETED orders whose supplier-added date is within [fromStr,toStr]
+ *  (yyyy-MM-dd inclusive) → per-supervisor {count, sumMins, cnt, avg}. */
+function completedByActor_(fromStr, toStr) {
+  const out = {};
+  ActivityLog.allRows().forEach(r => {
+    if (r[LG.STATE] !== ST_DONE) return;
+    const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
+    if (!dp || dp < fromStr || dp > toStr) return;
+    const actor = String(r[LG.ACTIVE] || '—') || '—';
+    const mins = Number(r[LG.MINS]) || 0;
+    const o = out[actor] || (out[actor] = { count: 0, sumMins: 0, cnt: 0 });
+    o.count++; if (mins > 0) { o.sumMins += mins; o.cnt++; }
+  });
+  Object.keys(out).forEach(k => { out[k].avg = out[k].cnt ? Math.round(out[k].sumMins / out[k].cnt) : 0; });
+  return out;
 }
 
 /* ════════════════════════════ MAIN ORCHESTRATION ════════════════════════════ */
@@ -616,7 +665,7 @@ function runMismar() {
     const matrix = readMatrix_();
     const normMap = buildNormMap_(matrix);
     const onLeave = readOnLeave_();
-    const state = State.load();          // ── CHANGE v8.1: load once, reuse for cost-date + attribution
+    const log = ActivityLog.read();     // one-row-per-order store (also our change-detection state)
 
     // 1) pending invoices
     const invoices = Api.fetchAllInvoices(cfg.token);
@@ -627,65 +676,46 @@ function runMismar() {
     const details = Api.fetchOrderDetails(orderIds, cfg.token, t0 + CFG.SOFT_TIME_LIMIT_MS);
     const truncated = details.__truncated === true; delete details.__truncated;
 
-    // 3) build the unified record set
+    // 3) build records
     const nowMs = Date.now();
     const records = invoices.map(inv => {
       const mx = matrix[inv.locM] || { p1: '—', p2: '—' };
       const active = (mx.p1 && onLeave[mx.p1]) ? (mx.p2 || mx.p1) : (mx.p1 || '—');
       const det = inv.orderId ? details[String(inv.orderId)] : null;
-      const prevState = inv.orderId ? state[String(inv.orderId)] : null;
+      const prev = inv.orderId ? ActivityLog.prev(log, inv.orderId) : null;
 
-      let status, cls, assignAt;
-      if (det) {
-        status = det.statusName; cls = classifyOrder_(status, cfg);
-        assignAt = resolveAssignAt_(det, inv.createdAt, cfg);
-      } else if (inv.orderId && truncated && orderIds.indexOf(String(inv.orderId)) >= 0 && !(String(inv.orderId) in details)) {
-        status = 'قيد التحديث'; cls = classifyOrder_('قيد التحديث', cfg); assignAt = inv.createdAt;
-      } else {
-        status = '—'; cls = classifyOrder_('—', cfg); assignAt = inv.createdAt;
-      }
+      let status, cls;
+      if (det) { status = det.statusName; cls = classifyOrder_(status, cfg); }
+      else if (inv.orderId && truncated && !(String(inv.orderId) in details)) { status = 'قيد التحديث'; cls = classifyOrder_('قيد التحديث', cfg); }
+      else { status = '—'; cls = classifyOrder_('—', cfg); }
 
-      const m = liveMetric_(assignAt, cls.blocked, cfg, nowMs);
+      // delivered timestamp (AHT start). From tracking; else last action time.
+      let deliveredAt = '';
+      if (cls.delivered) { const di = extractDeliveryInfo_(det, cfg); deliveredAt = di.deliveredAt || (det && det.actionAt) || ''; }
 
-      // ── CHANGE v8.1: cost/invoice creation time + delivery analytics.
-      const cost = resolveCostDate_(inv.createdAt, prevState);
-      const di = extractDeliveryInfo_(det, cfg);
-      let handlingMins = null;
-      if (cls.delivered) {
-        const fromAt = (cfg.handlingFrom === 'supplier' && di.supplierAddedAt) ? di.supplierAddedAt : assignAt;
-        const toAt = di.deliveredAt || (det && det.actionAt) || '';
-        if (fromAt && toAt) handlingMins = Util.businessMinutes(new Date(fromAt), new Date(toAt), cfg.shiftStart, cfg.shiftEnd, cfg.tz);
-      }
-
-      return {
+      const rec = {
         loc: inv.locM, orderId: inv.orderId, invoiceId: inv.invoiceId,
         p1: mx.p1 || '—', p2: mx.p2 || '—', active, status,
-        cat: cls.cat, delivered: cls.delivered, ready: cls.ready, blocked: cls.blocked, unknown: cls.unknown,
-        assignAt, lastActionAt: det ? det.actionAt : '', actor: det ? det.actor : '—',
-        mins: m.mins, dur: m.dur, breach: m.breach, note: m.note,
-        costDate: cost.at, costSource: cost.source,
-        supplierAddedAt: di.supplierAddedAt, supplierAddedBy: di.supplierAddedBy, supplierName: di.supplierName,
-        deliveredAt: di.deliveredAt, deliveredBy: di.deliveredBy, handlingMins,
+        cat: cls.cat, delivered: cls.delivered, ready: cls.ready, unknown: cls.unknown,
+        deliveredAt, costDisplay: resolveCostDisplay_(inv.createdAt, prev, cfg),
         p1OnLeave: !!onLeave[mx.p1]
       };
+      rec.metric = computeMetric_(rec, cfg, nowMs);
+      return rec;
     });
 
-    // 4) change/settlement/delivery detection → audit log (mutates + saves state)
-    detectAndLogChanges_(records, cfg, state);
+    // 4) upsert the one-row-per-order log + detect settlements (supplier added)
+    ActivityLog.update(log, records, cfg);
 
-    // 5) render everything (batched)
+    // 5) render (batched)
     renderMain_(ss, records, cfg);
-    renderStatusTabs_(ss, records, cfg);     // ── CHANGE v8.1: 3 tabs (delivered/ready/other)
+    renderStatusTabs_(ss, records, cfg);
     renderSummary_(ss, records, matrix, onLeave, cfg);
-    renderPerformance_(ss, records, onLeave, cfg);
-    renderDashboard_(ss, records, onLeave, cfg, truncated);
-
-    rotateAuditIfNeeded_();
+    renderDailyPerformance_(ss, records, onLeave, cfg);
 
     const secs = Math.round((Date.now() - t0) / 1000);
     const delivered = records.filter(r => r.cat === 'delivered').length;
-    notify_(`تم التحديث في ${secs}ث · فواتير ${invoices.length} · تم التسليم ${delivered}` +
-            (truncated ? ' · (تحديث جزئي)' : ''));
+    notify_(`تم التحديث في ${secs}ث · فواتير ${invoices.length} · تم التسليم ${delivered}` + (truncated ? ' · (تحديث جزئي)' : ''));
     console.log(`runMismar done in ${secs}s`);
   } catch (e) {
     if (e instanceof AuthError) {
@@ -700,90 +730,9 @@ function runMismar() {
   }
 }
 
-/** Change detection + settlement detection + delivery logging. */
-function detectAndLogChanges_(records, cfg, state) {
-  const now = Util.fmtDt(new Date(), cfg.tz);
-  const runIso = Util.nowIso();
-  const auditRows = [];
-  const currentIds = new Set();
-
-  records.forEach(r => {
-    if (!r.orderId) return;
-    const id = String(r.orderId);
-    currentIds.add(id);
-    const prev = state[id];
-
-    // helper to push a "delivered" audit row (── CHANGE v8.1)
-    const logDelivered = (fromStatus) => {
-      const note = `تم التسليم بواسطة ${r.deliveredBy || '—'}` +
-                   (r.supplierName ? ` | مورد: ${r.supplierName}` : '') +
-                   (r.supplierAddedBy && r.supplierAddedBy !== '—' ? ` | أضاف المورد: ${r.supplierAddedBy}` : '');
-      auditRows.push([
-        now, 'API', 'تم التسليم', id, r.invoiceId || '', r.loc, fromStatus || '', r.status,
-        r.active || r.deliveredBy || '—',
-        r.handlingMins != null ? r.handlingMins : '',
-        Util.fmtDt(r.costDate, cfg.tz),
-        r.supplierAddedAt ? Util.fmtDt(r.supplierAddedAt, cfg.tz) : '',
-        note
-      ]);
-    };
-
-    if (!prev) {
-      // brand-new invoice → record first-seen (sheet-addition time) + queue entry.
-      auditRows.push([now, 'API', 'دخول للطابور', id, r.invoiceId || '', r.loc, '', r.status, r.actor || '—', '',
-                      Util.fmtDt(r.costDate, cfg.tz), '', 'فاتورة جديدة']);
-      state[id] = { lastStatus: r.status, lastActionAt: r.lastActionAt, assignAt: r.assignAt,
-                    settled: false, settledAt: '', lastSeen: runIso,
-                    firstSeenAt: runIso, active: r.active, deliveredAt: '' };
-      if (r.delivered && r.deliveredAt) { logDelivered(''); state[id].deliveredAt = r.deliveredAt; }
-    } else {
-      if (r.status !== '—' && r.status !== 'قيد التحديث' && prev.lastStatus && prev.lastStatus !== r.status) {
-        auditRows.push([now, 'API', 'تغيّر الحالة', id, r.invoiceId || '', r.loc, prev.lastStatus, r.status, r.actor || '—', '',
-                        Util.fmtDt(r.costDate, cfg.tz), '', '']);
-      }
-      // first time we observe delivery for this order → log it once.
-      if (r.delivered && r.deliveredAt && !prev.deliveredAt) { logDelivered(prev.lastStatus); prev.deliveredAt = r.deliveredAt; }
-
-      prev.lastStatus = (r.status === '—' || r.status === 'قيد التحديث') ? prev.lastStatus : r.status;
-      prev.lastActionAt = r.lastActionAt || prev.lastActionAt;
-      if (!prev.assignAt) prev.assignAt = r.assignAt;
-      if (!prev.firstSeenAt) prev.firstSeenAt = runIso;
-      prev.active = r.active || prev.active;
-      prev.settled = false; prev.lastSeen = runIso;
-    }
-  });
-
-  // settlement: was tracked + open, now absent from the live queue.
-  Object.keys(state).forEach(id => {
-    const s = state[id];
-    if (s.settled || currentIds.has(id)) return;
-    const det = Api.fetchOrderDetail(id, cfg.token);   // one extra call for the true completion time
-    const di = det ? extractDeliveryInfo_(det, cfg) : null;
-    const settleAt = (di && di.deliveredAt) ? di.deliveredAt : (det && det.actionAt ? det.actionAt : runIso);
-    const actor = s.active || (det && det.actor ? det.actor : '—');
-
-    // handling time = milestone → completion (── CHANGE v8.1)
-    let handling = '';
-    const fromAt = (cfg.handlingFrom === 'supplier' && di && di.supplierAddedAt) ? di.supplierAddedAt : s.assignAt;
-    if (fromAt) handling = Util.businessMinutes(new Date(fromAt), new Date(settleAt), cfg.shiftStart, cfg.shiftEnd, cfg.tz);
-
-    auditRows.push([
-      Util.fmtDt(new Date(), cfg.tz), 'API', 'تمت التسوية', id, '', '', s.lastStatus, det ? det.statusName : 'منتهية',
-      actor, handling, '',
-      (di && di.supplierAddedAt) ? Util.fmtDt(di.supplierAddedAt, cfg.tz) : '',
-      'خرجت من الطابور' + (di && di.deliveredBy && di.deliveredBy !== '—' ? ' | سلّمها: ' + di.deliveredBy : '')
-    ]);
-    s.settled = true; s.settledAt = settleAt;
-  });
-
-  appendAudit_(auditRows);
-  State.save(state);
-}
-
 /* ════════════════════════════ RENDER HELPERS ════════════════════════════ */
 function getOrCreateSheet_(ss, name) { return ss.getSheetByName(name) || ss.insertSheet(name); }
 
-/** Generic batched table renderer for read-only sheets. */
 function renderTable_(sh, titleRow, header, body, colorFn, widths, opts) {
   opts = opts || {};
   sh.clearContents(); sh.clearFormats();
@@ -814,17 +763,17 @@ function renderTable_(sh, titleRow, header, body, colorFn, widths, opts) {
 }
 
 function queueSort_(a, b) {
-  const rank = r => r.breach ? 0 : (r.blocked ? 2 : 1);
+  // delivered breaches first, then delivered, then ready, then other
+  const rank = r => r.cat === 'delivered' ? (r.metric.breach ? 0 : 1) : (r.cat === 'ready' ? 2 : 3);
   const d = rank(a) - rank(b);
-  return d !== 0 ? d : (b.mins || 0) - (a.mins || 0);
+  return d !== 0 ? d : ((b.metric.mins || 0) - (a.metric.mins || 0));
 }
 
 function rowColor_(r) {
-  if (r.delivered) return CFG.C_GRN;       // ── CHANGE v8.1: delivered rows = green
-  if (r.breach) return CFG.C_ORG;
-  if (r.blocked) return CFG.C_GRY;
+  if (r.cat === 'delivered') return r.metric.breach ? CFG.C_ORG : CFG.C_GRN;
+  if (r.cat === 'ready') return CFG.C_BLU;
   if (r.p1OnLeave) return CFG.C_PRP;
-  return CFG.C_EVEN;
+  return CFG.C_GRY;
 }
 
 /* ── Main work queue (الطلبات) ── */
@@ -832,28 +781,27 @@ function renderMain_(ss, records, cfg) {
   const sh = getOrCreateSheet_(ss, CFG.SH_MAIN);
   const C = CFG.CM;
 
-  // preserve user-entered DONE + assign time keyed by invoiceId
+  // preserve user-entered DONE keyed by invoiceId
   const prev = {};
   if (sh.getLastRow() >= 2 && sh.getLastColumn() >= C.IID) {
     const w = Math.min(sh.getLastColumn(), C.COLS);
     sh.getRange(2, 1, sh.getLastRow() - 1, w).getValues().forEach(r => {
       const iid = String(r[C.IID - 1] || '');
-      if (iid) prev[iid] = { done: r[C.DONE - 1] === true, assign: r[C.ASSIGN - 1] };
+      if (iid) prev[iid] = { done: r[C.DONE - 1] === true };
     });
   }
 
   const open = records.slice().sort(queueSort_);
   const header = ['المركز', 'رقم الاوردر', 'رقم الفاتورة', 'P1 (اساسي)', 'P2 (احتياطي)',
-    'المسؤول الفعلي', 'حالة الاوردر', 'جاهزة للتدقيق؟', 'تم الإنجاز؟',
-    'وقت الإسناد', 'مدة المعالجة', 'الحالة/التأخير', 'وقت إضافة الفاتورة'];   // ── CHANGE v8.1: +cost col
+    'المسؤول الفعلي', 'حالة الاوردر', 'جاهزة؟', 'تم الإنجاز؟',
+    'وقت التسليم', 'مدة المعالجة (منذ التسليم)', 'الحالة/التأخير', 'وقت إضافة الفاتورة'];
 
   const body = open.map(r => {
     const st = prev[String(r.invoiceId)] || {};
-    const assignShown = st.assign || Util.fmtDt(r.assignAt, cfg.tz);
     const readyLabel = r.delivered ? '📦 تم التسليم' : (r.ready ? '✅ جاهزة' : '⛔ غير جاهزة');
     return [r.loc, r.orderId || '—', r.invoiceId || '—', r.p1, r.p2, r.active,
       r.status, readyLabel, st.done === true,
-      assignShown, r.dur, r.note, Util.fmtDt(r.costDate, cfg.tz)];
+      Util.dash(r.delivered ? Util.fmtDt(r.deliveredAt, cfg.tz) : ''), r.metric.dur, r.metric.note, Util.dash(r.costDisplay)];
   });
 
   sh.clearContents(); sh.clearFormats();
@@ -864,95 +812,71 @@ function renderMain_(ss, records, cfg) {
 
   if (body.length) {
     sh.getRange(2, 1, body.length, C.COLS).setValues(body.map(r => r.map((v, ci) =>
-      ci === (C.DONE - 1) ? v : Util.safeText(v))));   // keep DONE boolean, sanitise the rest
+      ci === (C.DONE - 1) ? v : Util.safeText(v))));
     sh.getRange(2, C.DONE, body.length, 1).insertCheckboxes();
     const bg = open.map(r => Array(C.COLS).fill(rowColor_(r)));
     sh.getRange(2, 1, body.length, C.COLS).setBackgrounds(bg);
-    // text format on text columns only (skip the DONE checkbox column 9)
     sh.getRange(2, 1, body.length, 8).setNumberFormat('@');
     sh.getRange(2, 10, body.length, 4).setNumberFormat('@');
   }
-  [225, 110, 110, 150, 150, 150, 175, 130, 90, 150, 105, 165, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  [225, 110, 110, 150, 150, 150, 175, 110, 90, 150, 175, 150, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
 }
 
-/* ── ── CHANGE v8.1: THREE status tabs (Delivered / Ready / Other) ── */
+/* ── Three status tabs ── */
 function renderStatusTabs_(ss, records, cfg) {
   const nowStr = Util.fmtDt(new Date(), cfg.tz);
 
-  // a) Delivered Orders — only «تم التسليم»
-  const delivered = records.filter(r => r.cat === 'delivered')
-    .sort((a, b) => (new Date(b.deliveredAt || 0)) - (new Date(a.deliveredAt || 0)));
+  // a) Delivered — only «تم التسليم». AHT clock is running. NO supplier column
+  //    (adding the supplier removes the order from the queue entirely).
+  const delivered = records.filter(r => r.cat === 'delivered').sort((a, b) => (b.metric.mins || 0) - (a.metric.mins || 0));
   const shD = getOrCreateSheet_(ss, CFG.SH_DELIVERED);
   renderTable_(shD,
-    `الطلبات تم التسليم (${delivered.length}) | ${nowStr}`,
+    `الطلبات تم التسليم — بانتظار مورد الصرف (${delivered.length}) | ${nowStr}`,
     ['المركز', 'رقم الاوردر', 'رقم الفاتورة', 'المسؤول الفعلي', 'الحالة',
-     'وقت إضافة الفاتورة', 'وقت إضافة مورد الصرف', 'مورد الصرف (بواسطة)',
-     'وقت التسليم', 'مدة المعالجة (مورد→تسليم)', 'إجمالي منذ الإسناد'],
+     'وقت إضافة الفاتورة', 'وقت التسليم', 'مدة المعالجة (منذ التسليم)', 'الحالة/التأخير'],
     delivered.map(r => [r.loc, r.orderId || '—', r.invoiceId || '—', r.active, r.status,
-      Util.fmtDt(r.costDate, cfg.tz),
-      r.supplierAddedAt ? Util.fmtDt(r.supplierAddedAt, cfg.tz) : '— (غير مسجّل)',
-      r.supplierAddedBy || '—',
-      Util.fmtDt(r.deliveredAt, cfg.tz),
-      r.handlingMins != null ? Util.fmtDuration(r.handlingMins) : '—',
-      r.dur]),
-    (r) => {
-      // highlight handling that breached the AHT target
-      const hm = parseHandlingCell_(r[9]);
-      return hm != null && hm > cfg.aht ? CFG.C_ORG : CFG.C_GRN;
-    },
-    [205, 105, 105, 165, 150, 150, 160, 150, 150, 180, 140],
+      Util.dash(r.costDisplay), Util.dash(Util.fmtDt(r.deliveredAt, cfg.tz)), r.metric.dur, r.metric.note]),
+    r => (String(r[8]) || '').indexOf('متأخر') > -1 ? CFG.C_ORG : CFG.C_GRN,
+    [205, 105, 105, 165, 150, 155, 150, 190, 175],
     { headerBg: '#1b5e20' });
 
-  // b) Ready Orders — auditable but not yet delivered
-  const ready = records.filter(r => r.cat === 'ready').sort((a, b) => (b.mins || 0) - (a.mins || 0));
+  // b) Ready — auditable but not yet delivered. AHT does NOT count here.
+  const ready = records.filter(r => r.cat === 'ready').sort((a, b) => String(a.loc).localeCompare(String(b.loc)));
   const shR = getOrCreateSheet_(ss, CFG.SH_READY);
   renderTable_(shR,
-    `الطلبات الجاهزة للتدقيق (${ready.length}) | ${nowStr}`,
-    ['المركز', 'رقم الاوردر', 'رقم الفاتورة', 'المسؤول الفعلي', 'الحالة', 'وقت إضافة الفاتورة', 'مدة الانتظار', 'الحالة/التأخير'],
-    ready.map(r => [r.loc, r.orderId || '—', r.invoiceId || '—', r.active, r.status, Util.fmtDt(r.costDate, cfg.tz), r.dur, r.note]),
-    r => (String(r[7]) || '').indexOf('متأخر') > -1 ? CFG.C_ORG : CFG.C_EVEN,
-    [210, 110, 110, 165, 175, 150, 120, 165],
+    `الطلبات الجاهزة — بانتظار التسليم (${ready.length}) | ${nowStr}`,
+    ['المركز', 'رقم الاوردر', 'رقم الفاتورة', 'المسؤول الفعلي', 'الحالة', 'وقت إضافة الفاتورة', 'ملاحظة'],
+    ready.map(r => [r.loc, r.orderId || '—', r.invoiceId || '—', r.active, r.status, Util.dash(r.costDisplay), 'بانتظار التسليم — لا يُحتسب AHT']),
+    () => CFG.C_BLU,
+    [210, 110, 110, 165, 190, 155, 210],
     { headerBg: '#1565c0' });
 
-  // c) Other Orders — every remaining status (waiting / unknown / blocked)
+  // c) Other — every remaining status
   const other = records.filter(r => r.cat === 'other').sort((a, b) => String(a.loc).localeCompare(String(b.loc)));
   const shO = getOrCreateSheet_(ss, CFG.SH_OTHER);
   renderTable_(shO,
     `طلبات أخرى — حالات مختلفة (${other.length}) | ${nowStr}`,
     ['المركز', 'رقم الاوردر', 'رقم الفاتورة', 'المسؤول الفعلي', 'الحالة', 'وقت إضافة الفاتورة', 'ملاحظة'],
-    other.map(r => [r.loc, r.orderId || '—', r.invoiceId || '—', r.active, r.status, Util.fmtDt(r.costDate, cfg.tz),
+    other.map(r => [r.loc, r.orderId || '—', r.invoiceId || '—', r.active, r.status, Util.dash(r.costDisplay),
       r.unknown ? 'بانتظار تحديث الحالة' : 'بانتظار جهة أخرى']),
     () => CFG.C_GRY,
-    [210, 110, 110, 165, 200, 150, 175],
+    [210, 110, 110, 165, 200, 155, 175],
     { headerBg: '#546e7a' });
 
-  // migrate the old single "not ready" tab away (kept as a friendly redirect note)
+  // clean up the legacy single "not ready" tab
   const legacy = ss.getSheetByName(CFG.SH_NOTREADY);
-  if (legacy && legacy.getName() !== CFG.SH_OTHER) {
-    try { ss.deleteSheet(legacy); } catch (e) { /* if it's the last visible sheet, ignore */ }
-  }
+  if (legacy && legacy.getName() !== CFG.SH_OTHER) { try { ss.deleteSheet(legacy); } catch (e) {} }
 }
 
-/** Parse a "Xس Yد" duration cell back to minutes (for conditional coloring). */
-function parseHandlingCell_(s) {
-  s = String(s || '');
-  if (!s || s === '—') return null;
-  let mins = 0;
-  const h = s.match(/(\d+)\s*س/); const m = s.match(/(\d+)\s*د/);
-  if (h) mins += parseInt(h[1], 10) * 60;
-  if (m) mins += parseInt(m[1], 10);
-  return mins;
-}
-
-/* ── Summary by center (── CHANGE v8.1: now also counts delivered) ── */
+/* ── Summary by center ── */
 function renderSummary_(ss, records, matrix, onLeave, cfg) {
   const sh = getOrCreateSheet_(ss, CFG.SH_SUMMARY);
   const map = {};
   records.forEach(r => {
     const m = map[r.loc] || (map[r.loc] = { total: 0, delivered: 0, ready: 0, delayed: 0, other: 0 });
     m.total++;
-    if (r.cat === 'delivered') m.delivered++;
-    else if (r.cat === 'ready') { m.ready++; if (r.breach) m.delayed++; }
+    if (r.cat === 'delivered') { m.delivered++; if (r.metric.breach) m.delayed++; }
+    else if (r.cat === 'ready') m.ready++;
     else m.other++;
   });
   const nowStr = Util.fmtDt(new Date(), cfg.tz);
@@ -973,347 +897,167 @@ function renderSummary_(ss, records, matrix, onLeave, cfg) {
     [230, 120, 150, 150, 150, 100, 90, 95, 90], { headerBg: '#1565c0' });
 }
 
-/* ── Supervisor performance (live queue + today's delivered/handling from the log) ── */
-function renderPerformance_(ss, records, onLeave, cfg) {
-  const sh = getOrCreateSheet_(ss, CFG.SH_PERF);
+/* ── ── CHANGE v8.2: DAILY PERFORMANCE (replaces dashboard + supervisors perf) ── */
+function renderDailyPerformance_(ss, records, onLeave, cfg) {
+  const sh = getOrCreateSheet_(ss, CFG.SH_DAILY);
 
-  const agg = {};
+  // live load per supervisor
+  const live = {};
   records.forEach(r => {
     if (r.active === '—') return;
-    const a = agg[r.active] || (agg[r.active] = { open: 0, blocked: 0, breached: 0, deliveredLive: 0 });
-    if (r.cat === 'delivered') { a.deliveredLive++; a.open++; }
-    else if (r.blocked) a.blocked++;
-    else { a.open++; if (r.breach) a.breached++; }
+    const a = live[r.active] || (live[r.active] = { total: 0, deliveredOpen: 0, breached: 0 });
+    a.total++;
+    if (r.cat === 'delivered') { a.deliveredOpen++; if (r.metric.breach) a.breached++; }
   });
 
-  // ── CHANGE v8.1: today's completed metrics (delivered + settled) incl. handling.
-  const done = completedTodayByActor_(cfg);
+  // today's completions (supplier added today) from the one-row log
+  const today = Util.todayStr(cfg.tz);
+  const done = completedByActor_(today, today);
 
   const nowStr = Util.fmtDt(new Date(), cfg.tz);
-  const header = ['المشرف', 'مُسنَد', 'مفتوحة', 'محجوبة', 'متأخرة',
-    'سُلِّم اليوم', 'مورد الصرف اليوم', 'متوسط المعالجة (مورد→تسليم)', 'التقييم'];
-  const names = Object.keys(agg).sort((a, b) => (agg[b].open + agg[b].blocked) - (agg[a].open + agg[a].blocked));
+  const names = [...new Set([...Object.keys(live), ...Object.keys(done)])]
+    .filter(n => n && n !== '—')
+    .sort((a, b) => ((live[b] ? live[b].total : 0) - (live[a] ? live[a].total : 0)));
+
+  const header = ['المشرف', 'إجمالي المسند', 'تم التسليم (قيد الإنجاز)', 'أنجز اليوم', 'متوسط المعالجة اليوم', 'متأخرة الآن'];
   const body = names.map(name => {
-    const a = agg[name];
+    const a = live[name] || { total: 0, deliveredOpen: 0, breached: 0 };
+    const d = done[name] || { count: 0, avg: 0 };
     const off = !!onLeave[name];
-    const d = done[name] || { count: 0, avg: 0, supplierCount: 0 };
-    const score = a.open === 0 ? '—' : (a.breached === 0 ? 'ممتاز 🌟' : (a.breached <= 2 ? 'جيد 👍' : 'يحتاج متابعة ⚠️'));
-    return [(off ? '🏖 ' : '') + name, a.open + a.blocked, a.open, a.blocked, a.breached,
-      d.count, d.supplierCount, d.avg ? Util.fmtDuration(d.avg) : '—', off ? '🏖 على إجازة' : score];
+    return [(off ? '🏖 ' : '') + name, a.total, a.deliveredOpen, d.count, d.avg ? Util.fmtDuration(d.avg) : '—', a.breached];
   });
+  // totals row
+  const col = c => body.reduce((s, r) => s + (Number(r[c]) || 0), 0);
+  body.push(['الإجمالي', col(1), col(2), col(3), '—', col(5)]);
 
   renderTable_(sh,
-    `أداء المشرفين الحي | ${nowStr}`,
+    `الأداء اليومي — ${today} | ${nowStr}`,
     header, body,
-    (r, i) => String(r[0]).indexOf('🏖') > -1 ? CFG.C_PRP : (Number(r[4]) > 0 ? CFG.C_ORG : (Number(r[5]) > 0 ? CFG.C_GRN : (i % 2 ? CFG.C_EVEN : CFG.C_ODD))),
-    [185, 95, 95, 95, 95, 105, 130, 200, 150], { headerBg: '#1a237e' });
+    (r, i) => i === body.length - 1 ? CFG.C_HDR
+      : (String(r[0]).indexOf('🏖') > -1 ? CFG.C_PRP
+        : (Number(r[5]) > 0 ? CFG.C_ORG : (Number(r[3]) > 0 ? CFG.C_GRN : (i % 2 ? CFG.C_EVEN : CFG.C_ODD)))),
+    [200, 130, 175, 120, 175, 120], { headerBg: '#1a237e' });
 }
 
-/** ── CHANGE v8.1: read today's «تم التسليم»/«تمت التسوية» rows from the structured
- *  log and aggregate per actor: completions, supplier-adds, avg handling minutes.
- *  De-dupes a delivered + settled pair for the same order so we don't double count. */
-function completedTodayByActor_(cfg) {
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SH_AUDIT);
-  const out = {};
-  if (!sh || sh.getLastRow() < 2) return out;
-  const today = Utilities.formatDate(new Date(), cfg.tz, 'yyyy-MM-dd');
-  const W = CFG.AUDIT_COLS;
-  const data = sh.getRange(2, 1, sh.getLastRow() - 1, W).getValues();
+/* ════════════════════════════ REPORTS (from the one-row log) ════════════════════════════ */
+function buildWeeklyReport()  { const c = getConfig_(); buildRangeReport_(Util.daysAgoStr(c.tz, 7),  Util.todayStr(c.tz), 'التقرير الأسبوعي', CFG.SH_LOG_W); }
+function buildMonthlyReport() { const c = getConfig_(); buildRangeReport_(Util.daysAgoStr(c.tz, 30), Util.todayStr(c.tz), 'التقرير الشهري',  CFG.SH_LOG_M); }
 
-  // pass 1: which orders already have a "delivered" row today
-  const deliveredOrders = new Set();
-  data.forEach(r => {
-    if (String(r[0] || '').substr(0, 10) !== today) return;
-    if (String(r[2] || '').indexOf('تسليم') > -1) deliveredOrders.add(String(r[3] || ''));
-  });
-
-  // pass 2: aggregate
-  data.forEach(r => {
-    const ts = String(r[0] || ''); if (ts.substr(0, 10) !== today) return;
-    const action = String(r[2] || ''), oid = String(r[3] || ''), actor = String(r[8] || '—');
-    const mins = Number(r[9]) || 0, supplierAt = String(r[11] || '');
-    const isDelivered = action.indexOf('تسليم') > -1;
-    const isSettle = action.indexOf('تسوية') > -1;
-    if (!isDelivered && !isSettle) return;
-    if (isSettle && deliveredOrders.has(oid)) return;     // avoid double-count
-    const o = out[actor] || (out[actor] = { count: 0, sumHandling: 0, handlingCount: 0, supplierCount: 0 });
-    o.count++;
-    if (mins > 0) { o.sumHandling += mins; o.handlingCount++; }
-    if (supplierAt) o.supplierCount++;
-  });
-  Object.keys(out).forEach(k => { const o = out[k]; o.avg = o.handlingCount ? Math.round(o.sumHandling / o.handlingCount) : 0; });
-  return out;
+/** ── CHANGE v8.2: pick a from/to date and build the report for that range. */
+function buildDateRangeReport() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+  const f = ui.prompt('تقرير حسب التاريخ', 'من تاريخ (YYYY-MM-DD):', ui.ButtonSet.OK_CANCEL);
+  if (f.getSelectedButton() !== ui.Button.OK) return;
+  const t = ui.prompt('تقرير حسب التاريخ', 'إلى تاريخ (YYYY-MM-DD):', ui.ButtonSet.OK_CANCEL);
+  if (t.getSelectedButton() !== ui.Button.OK) return;
+  const from = f.getResponseText().trim(), to = t.getResponseText().trim();
+  const ok = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!ok(from) || !ok(to)) { ui.alert('صيغة التاريخ غير صحيحة. استخدم YYYY-MM-DD.'); return; }
+  const lo = from <= to ? from : to, hi = from <= to ? to : from;
+  buildRangeReport_(lo, hi, `تقرير من ${lo} إلى ${hi}`, CFG.SH_RANGE);
+  SpreadsheetApp.setActiveSheet(SpreadsheetApp.getActive().getSheetByName(CFG.SH_RANGE));
 }
 
-/* ════════════════════════════ DASHBOARD (rewritten, fully batched) ════════════════════════════ */
-// ── CHANGE v8.1: the old dashboard wrote cell-by-cell (slow). This version
-// assembles each block as a 2D array and pushes it with a single setValues +
-// single setBackgrounds, which is dramatically faster and easier to extend.
-function renderDashboard_(ss, records, onLeave, cfg, truncated) {
-  const dash = getOrCreateSheet_(ss, CFG.SH_DASH);
-  dash.clearContents(); dash.clearFormats();
-  dash.getCharts().forEach(ch => dash.removeChart(ch));
+/** Core report engine: aggregates COMPLETED orders (supplier added) in a date
+ *  range into per-supervisor + per-center tables. */
+function buildRangeReport_(fromStr, toStr, title, sheetName) {
+  const cfg = getConfig_();
+  const ss = SpreadsheetApp.getActive();
+  const rows = ActivityLog.allRows();
 
-  const nowStr = Util.fmtDt(new Date(), cfg.tz);
-
-  // ---- aggregate once ----
-  let delivered = 0, ready = 0, other = 0, delayed = 0;
-  const load = {};                  // per-supervisor live load
-  records.forEach(r => {
-    if (r.cat === 'delivered') delivered++;
-    else if (r.cat === 'ready') { ready++; if (r.breach) delayed++; }
-    else other++;
-    if (r.active !== '—') {
-      const a = load[r.active] || (load[r.active] = { total: 0, del: 0, blk: 0, brk: 0 });
-      a.total++;
-      if (r.cat === 'delivered') a.del++;
-      else if (r.blocked) a.blk++;
-      else if (r.breach) a.brk++;
-    }
+  const byAgent = {}, byLoc = {};
+  let totalDone = 0;
+  rows.forEach(r => {
+    if (r[LG.STATE] !== ST_DONE) return;
+    const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
+    if (!dp || dp < fromStr || dp > toStr) return;
+    totalDone++;
+    const agent = String(r[LG.ACTIVE] || '—') || '—';
+    const loc = String(r[LG.LOC] || '—') || '—';
+    const mins = Number(r[LG.MINS]) || 0;
+    const a = byAgent[agent] || (byAgent[agent] = { done: 0, sumMins: 0, cnt: 0 });
+    a.done++; if (mins > 0) { a.sumMins += mins; a.cnt++; }
+    const l = byLoc[loc] || (byLoc[loc] = { done: 0 }); l.done++;
   });
-  const auditable = ready + delivered;
-  const slaPct = auditable > 0 ? Math.round((auditable - delayed) / auditable * 100) : 100;
-  const done = completedTodayByActor_(cfg);
-  const deliveredToday = Object.values(done).reduce((a, d) => a + d.count, 0);
-  const handAvgAll = (() => {
-    let s = 0, c = 0; Object.values(done).forEach(d => { s += d.sumHandling; c += d.handlingCount; });
-    return c ? Math.round(s / c) : 0;
-  })();
-  const leaveN = Object.keys(onLeave).length;
 
-  const COLS = 9;
-  let R = 1;
+  const sh = getOrCreateSheet_(ss, sheetName);
+  sh.clearContents(); sh.clearFormats();
+  const nowStr = Utilities.formatDate(new Date(), cfg.tz, 'yyyy-MM-dd HH:mm');
 
-  // ---- title + subtitle + credit (3 banner rows) ----
-  dash.getRange(R, 1, 1, COLS).merge()
-    .setValue('لوحة التحكم — نظام مراقبة الفواتير · مسمار v8.1')
-    .setBackground('#0d1b2a').setFontColor('#e3f2fd').setFontSize(16).setFontWeight('bold')
-    .setHorizontalAlignment('center').setVerticalAlignment('middle');
-  dash.setRowHeight(R, 54); R++;
+  sh.getRange(1, 1, 1, 5).merge().setValue(`${title} — إجمالي المكتمل: ${totalDone} | ${nowStr}`)
+    .setBackground(CFG.C_HDR).setFontColor('#fff').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.setRowHeight(1, 44);
 
-  dash.getRange(R, 1, 1, COLS).merge()
-    .setValue(`آخر تحديث: ${nowStr} · شيفت ${cfg.shiftStart}:00–${cfg.shiftEnd}:00 · هدف AHT ${cfg.aht}د` +
-              (truncated ? ' · (تحديث جزئي)' : ''))
-    .setBackground('#162032').setFontColor('#90caf9').setFontSize(10).setHorizontalAlignment('center');
-  dash.setRowHeight(R, 24); R++;
+  let R = 3;
+  sh.getRange(R, 1, 1, 4).setValues([['المشرف', 'أنجز (تم التسليم ثم مورد الصرف)', 'متوسط المعالجة', 'إجمالي دقائق']])
+    .setBackground('#1976d2').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
+  const agents = Object.keys(byAgent).sort((a, b) => byAgent[b].done - byAgent[a].done);
+  if (agents.length) {
+    const body = agents.map(name => { const x = byAgent[name]; return [name, x.done, x.cnt ? Util.fmtDuration(Math.round(x.sumMins / x.cnt)) : '—', x.sumMins]; });
+    sh.getRange(R, 1, body.length, 4).setValues(body.map(r => r.map(Util.safeText)))
+      .setBackgrounds(body.map((r, i) => Array(4).fill(i % 2 ? CFG.C_EVEN : CFG.C_ODD)));
+    R += body.length;
+  } else { sh.getRange(R, 1).setValue('لا توجد طلبات مكتملة في هذه الفترة.'); R++; }
 
-  dash.getRange(R, 1, 1, 5).merge().setValue('Built by Ahmed Elsaadi')
-    .setBackground('#0d1b2a').setFontColor('#607d8b').setFontSize(9).setHorizontalAlignment('left');
-  dash.getRange(R, 6, 1, 4).merge()
-    .setFormula('=HYPERLINK("https://www.linkedin.com/in/ahmed-elsaadi","LinkedIn: Ahmed Elsaadi")')
-    .setBackground('#0d1b2a').setFontColor('#1e88e5').setFontSize(9).setHorizontalAlignment('right');
-  dash.setRowHeight(R, 20); R += 2;
-
-  // ---- KPI cards (titles row + values row, each written in ONE call) ----
-  const cards = [
-    { t: 'اجمالي الفواتير', v: records.length, c: '#37474f' },
-    { t: 'تم التسليم', v: delivered, c: '#1b5e20' },
-    { t: 'جاهزة للتدقيق', v: ready, c: '#1565c0' },
-    { t: 'طلبات أخرى', v: other, c: '#546e7a' },
-    { t: 'متأخرة عن الهدف', v: delayed, c: '#e65100' },
-    { t: 'الالتزام بالSLA', v: slaPct + '%', c: slaPct >= 90 ? '#2e7d32' : '#c62828' },
-    { t: 'سُلّم اليوم', v: deliveredToday, c: '#00695c' },
-    { t: 'متوسط المعالجة', v: handAvgAll ? Util.fmtDuration(handAvgAll) : '—', c: '#4527a0' },
-    { t: 'على إجازة اليوم', v: leaveN, c: '#4a148c' }
-  ];
-  dash.getRange(R, 1, 1, COLS).setValues([cards.map(c => c.t)])
-    .setBackgrounds([cards.map(c => c.c)]).setFontColor('#fff')
-    .setFontWeight('bold').setFontSize(9).setHorizontalAlignment('center').setVerticalAlignment('middle');
-  dash.setRowHeight(R, 30); R++;
-  dash.getRange(R, 1, 1, COLS).setValues([cards.map(c => c.v)])
-    .setBackgrounds([cards.map(() => '#fafafa')]).setFontColors([cards.map(c => c.c)])
-    .setFontWeight('bold').setFontSize(17).setHorizontalAlignment('center').setVerticalAlignment('middle');
-  dash.setRowHeight(R, 52);
-  for (let i = 0; i < COLS; i++) dash.setColumnWidth(i + 1, 122);
   R += 2;
+  sh.getRange(R, 1, 1, 2).setValues([['المركز', 'عدد المكتمل']])
+    .setBackground('#6a1b9a').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
+  Object.keys(byLoc).sort((a, b) => byLoc[b].done - byLoc[a].done).forEach((loc, i) => {
+    sh.getRange(R, 1, 1, 2).setValues([[loc, byLoc[loc].done]]).setBackground(i % 2 ? CFG.C_EVEN : CFG.C_ODD); R++;
+  });
 
-  // ---- Supervisors performance block (title + header + rows, batched) ----
-  dash.getRange(R, 1, 1, 7).merge().setValue('أداء المشرفين — حي + إنجاز اليوم')
-    .setBackground('#1a237e').setFontColor('#fff').setFontSize(11).setFontWeight('bold').setHorizontalAlignment('center');
-  dash.setRowHeight(R, 28); R++;
-
-  const perfHeader = ['المشرف', 'مسندة', 'متأخرة', 'محجوبة', 'سُلِّم اليوم', 'متوسط المعالجة', 'الحالة'];
-  dash.getRange(R, 1, 1, 7).setValues([perfHeader])
-    .setBackground('#283593').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center');
-  dash.setRowHeight(R, 26); R++;
-
-  const supNames = Object.keys(load).sort((a, b) => load[b].total - load[a].total);
-  if (supNames.length) {
-    const rows = [], colors = [];
-    supNames.forEach((name, idx) => {
-      const a = load[name], off = !!onLeave[name], d = done[name] || { count: 0, avg: 0 };
-      const status = off ? '🏖 على إجازة' : (a.brk === 0 ? '✅ جيد' : '⚠️ ' + a.brk + ' متأخرة');
-      rows.push([(off ? '🏖 ' : '') + name, a.total, a.brk, a.blk, d.count, d.avg ? Util.fmtDuration(d.avg) : '—', status]);
-      const c = off ? CFG.C_PRP : (a.brk > 0 ? CFG.C_ORG : (d.count > 0 ? CFG.C_GRN : (idx % 2 ? CFG.C_EVEN : CFG.C_ODD)));
-      colors.push(Array(7).fill(c));
-    });
-    dash.getRange(R, 1, rows.length, 7).setValues(rows).setBackgrounds(colors).setHorizontalAlignment('center');
-    R += rows.length;
-  }
-  R += 1;
-
-  // ---- Top centers + chart (batched) ----
-  const locCount = {};
-  records.forEach(r => { locCount[r.loc] = (locCount[r.loc] || 0) + 1; });
-  const top = Object.keys(locCount).sort((a, b) => locCount[b] - locCount[a]).slice(0, 10);
-
-  dash.getRange(R, 1, 1, 2).merge().setValue('أكثر 10 مراكز فواتير معلقة')
-    .setBackground('#c62828').setFontColor('#fff').setFontSize(11).setFontWeight('bold').setHorizontalAlignment('center');
-  dash.setRowHeight(R, 28); R++;
-  const chartStart = R;
-  if (top.length) {
-    const rows = top.map(loc => [loc, locCount[loc]]);
-    const colors = top.map((loc, idx) => [idx < 3 ? CFG.C_RED : (idx % 2 ? CFG.C_EVEN : CFG.C_ODD), idx < 3 ? CFG.C_RED : (idx % 2 ? CFG.C_EVEN : CFG.C_ODD)]);
-    dash.getRange(R, 1, rows.length, 2).setValues(rows).setBackgrounds(colors);
-    dash.getRange(R, 2, rows.length, 1).setFontWeight('bold').setHorizontalAlignment('center');
-    R += rows.length;
-
-    try {
-      const chart = dash.newChart().asColumnChart()
-        .addRange(dash.getRange(chartStart, 1, top.length, 2))
-        .setPosition(chartStart, 4, 0, 0)
-        .setOption('title', 'الفواتير حسب المركز')
-        .setOption('legend', { position: 'none' })
-        .setOption('colors', ['#1565c0'])
-        .setOption('width', 540).setOption('height', 300)
-        .build();
-      dash.insertChart(chart);
-    } catch (e) { console.warn('chart build skipped: ' + e); }
-  }
-  dash.setFrozenRows(1);
+  [230, 260, 150, 130].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  sh.setFrozenRows(1);
+  alertSafe_(title + ' جاهز.');
 }
 
-/* ════════════════════════════ ACTIVITY SEARCH (filter the audit log) ════════════════════════════ */
+/* ════════════════════════════ ACTIVITY SEARCH ════════════════════════════ */
 function searchActivity() {
   const ui = SpreadsheetApp.getUi();
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SH_AUDIT);
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SH_LOG);
   if (!sh || sh.getLastRow() < 2) { ui.alert('سجل النشاط فارغ.'); return; }
+
+  const oidRes = ui.prompt('بحث النشاط', 'رقم الأوردر (اتركه فارغًا للكل):', ui.ButtonSet.OK_CANCEL);
+  if (oidRes.getSelectedButton() !== ui.Button.OK) return;
+  const oid = oidRes.getResponseText().trim();
 
   const agentRes = ui.prompt('بحث النشاط', 'اسم المشرف (اتركه فارغًا للكل):', ui.ButtonSet.OK_CANCEL);
   if (agentRes.getSelectedButton() !== ui.Button.OK) return;
   const agent = agentRes.getResponseText().trim();
 
-  const dateRes = ui.prompt('بحث النشاط', 'التاريخ بصيغة YYYY-MM-DD (اتركه فارغًا للكل):', ui.ButtonSet.OK_CANCEL);
+  const dateRes = ui.prompt('بحث النشاط', 'التاريخ YYYY-MM-DD (يطابق أي مرحلة، فارغ=الكل):', ui.ButtonSet.OK_CANCEL);
   if (dateRes.getSelectedButton() !== ui.Button.OK) return;
   const date = dateRes.getResponseText().trim();
 
-  const orderRes = ui.prompt('بحث النشاط', 'رقم الأوردر (اتركه فارغًا للكل):', ui.ButtonSet.OK_CANCEL);
-  if (orderRes.getSelectedButton() !== ui.Button.OK) return;
-  const order = orderRes.getResponseText().trim();
-
-  const W = CFG.AUDIT_COLS;
-  const header = sh.getRange(1, 1, 1, W).getValues();
-  const data = sh.getRange(2, 1, sh.getLastRow() - 1, W).getValues();
+  const data = ActivityLog.allRows();
+  const dateCols = [LG.COST, LG.FIRST, LG.READY, LG.DELIVERED, LG.SUPPLIER];
   const hits = data.filter(r => {
-    if (agent && String(r[8] || '').indexOf(agent) === -1) return false;
-    if (date && String(r[0] || '').substr(0, 10) !== date) return false;
-    if (order && String(r[3] || '') !== order) return false;
+    if (oid && String(r[LG.OID] || '') !== oid) return false;
+    if (agent && String(r[LG.ACTIVE] || '').indexOf(agent) === -1) return false;
+    if (date && !dateCols.some(c => String(r[c] || '').substr(0, 10) === date)) return false;
     return true;
   });
 
   const out = getOrCreateSheet_(SpreadsheetApp.getActive(), CFG.SH_SEARCH);
   out.clearContents(); out.clearFormats();
-  out.getRange(1, 1, 1, W).setValues(header).setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
-  if (hits.length) out.getRange(2, 1, hits.length, W).setValues(hits);
+  out.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]).setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
+  if (hits.length) out.getRange(2, 1, hits.length, LOG_COLS).setValues(hits.map(r => r.map(Util.safeText)));
   out.setFrozenRows(1);
   SpreadsheetApp.setActiveSheet(out);
   ui.alert(`عدد النتائج: ${hits.length}`);
 }
 
-/* ════════════════════════════ PERIODIC REPORTS (from structured audit log) ════════════════════════════ */
-function buildWeeklyReport()  { buildReport_('week'); }
-function buildMonthlyReport() { buildReport_('month'); }
-
-function buildReport_(period) {
-  const cfg = getConfig_();
-  const ss = SpreadsheetApp.getActive();
-  const audit = ss.getSheetByName(CFG.SH_AUDIT);
-  if (!audit || audit.getLastRow() < 2) { alertSafe_('سجل النشاط فارغ — لا توجد بيانات للتقرير.'); return; }
-
-  const cutoff = new Date();
-  if (period === 'week') cutoff.setDate(cutoff.getDate() - 7); else cutoff.setMonth(cutoff.getMonth() - 1);
-
-  const W = CFG.AUDIT_COLS;
-  const data = audit.getRange(2, 1, audit.getLastRow() - 1, W).getValues();
-  const byAgent = {}, byLoc = {};
-  data.forEach(r => {
-    const ts = new Date(r[0]); if (isNaN(ts) || ts < cutoff) return;
-    const action = String(r[2] || ''), agent = String(r[8] || '—'), loc = String(r[5] || '—'), mins = Number(r[9]) || 0;
-    const supplierAt = String(r[11] || '');
-    const isSettle = action.indexOf('تسوية') > -1;
-    const isDelivered = action.indexOf('تسليم') > -1;     // ── CHANGE v8.1
-    const isChange = action.indexOf('تغيّر') > -1;
-    const a = byAgent[agent] || (byAgent[agent] = { actions: 0, completed: 0, sumMins: 0, handCount: 0, supplier: 0 });
-    a.actions++;
-    if (isSettle || isDelivered) { a.completed++; if (mins > 0) { a.sumMins += mins; a.handCount++; } if (supplierAt) a.supplier++; }
-    if (loc !== '—' && (isSettle || isChange || isDelivered)) { const l = byLoc[loc] || (byLoc[loc] = { actions: 0 }); l.actions++; }
-  });
-
-  const shName = period === 'week' ? CFG.SH_LOG_W : CFG.SH_LOG_M;
-  const sh = getOrCreateSheet_(ss, shName);
-  sh.clearContents(); sh.clearFormats();
-  const title = period === 'week' ? 'التقرير الاسبوعي' : 'التقرير الشهري';
-  const nowStr = Utilities.formatDate(new Date(), cfg.tz, 'yyyy-MM-dd');
-
-  sh.getRange(1, 1, 1, 6).merge().setValue(`${title} | ${nowStr}`)
-    .setBackground(CFG.C_HDR).setFontColor('#fff').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.setRowHeight(1, 44);
-
-  let R = 3;
-  // ── CHANGE v8.1: report now includes supplier-adds + avg handling time.
-  sh.getRange(R, 1, 1, 6).setValues([['المشرف', 'إجمالي الإجراءات', 'مكتملة/مسلّمة', 'مورد الصرف', 'متوسط المعالجة', 'إنتاجية']])
-    .setBackground('#1976d2').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
-  Object.keys(byAgent).sort((a, b) => byAgent[b].completed - byAgent[a].completed).forEach((name, i) => {
-    const x = byAgent[name];
-    const avg = x.handCount ? Util.fmtDuration(Math.round(x.sumMins / x.handCount)) : '—';
-    sh.getRange(R, 1, 1, 6).setValues([[name, x.actions, x.completed, x.supplier, avg, x.completed]])
-      .setBackground(i % 2 ? CFG.C_EVEN : CFG.C_ODD); R++;
-  });
-
-  R += 2;
-  sh.getRange(R, 1, 1, 2).setValues([['المركز', 'عدد الإجراءات']])
-    .setBackground('#6a1b9a').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
-  Object.keys(byLoc).sort((a, b) => byLoc[b].actions - byLoc[a].actions).forEach((loc, i) => {
-    sh.getRange(R, 1, 1, 2).setValues([[loc, byLoc[loc].actions]]).setBackground(i % 2 ? CFG.C_EVEN : CFG.C_ODD); R++;
-  });
-
-  [220, 150, 140, 120, 150, 110].forEach((w, i) => sh.setColumnWidth(i + 1, w));
-  sh.setFrozenRows(1);
-  alertSafe_(title + ' جاهز.');
-}
-
-/* ════════════════════════════ onEdit (agent action logging) ════════════════════════════ */
+/* ════════════════════════════ onEdit (visual only — keeps the log one-row) ════════════════════════════ */
 function onEdit(e) {
   try {
     const sh = e.range.getSheet();
     if (sh.getName() !== CFG.SH_MAIN) return;
     const C = CFG.CM, row = e.range.getRow(), col = e.range.getColumn();
     if (col !== C.DONE || row <= 1) return;
-
-    const cfg = getConfig_();
-    const tz = cfg.tz;
-    const nowStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
     const checked = e.range.getValue() === true;
-
-    if (checked) {
-      sh.getRange(row, C.ASSIGN).setValue(nowStr);
-      sh.getRange(row, 1, 1, C.COLS).setBackground(CFG.C_YEL);
-    } else {
-      sh.getRange(row, C.ASSIGN).clearContent();
-      sh.getRange(row, 1, 1, C.COLS).setBackground(null);
-    }
-
-    let user = '';
-    try { user = Session.getActiveUser().getEmail(); } catch (e2) {}
-    const oid = sh.getRange(row, C.OID).getValue();
-    const iid = sh.getRange(row, C.IID).getValue();
-    const loc = sh.getRange(row, C.LOC).getValue();
-    const cost = sh.getRange(row, C.COST).getValue();   // ── CHANGE v8.1: carry cost time into log
-    appendAudit_([[
-      Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'),
-      'SHEET', checked ? 'وضع علامة إنجاز' : 'إلغاء الإنجاز',
-      oid || '', iid || '', loc || '', '', '', user || 'مستخدم', '', cost || '', '', ''
-    ]]);
+    // just highlight — completion is tracked automatically when the order leaves the queue
+    sh.getRange(row, 1, 1, C.COLS).setBackground(checked ? CFG.C_YEL : null);
   } catch (err) {
     console.warn('onEdit: ' + err);
   }
@@ -1325,6 +1069,7 @@ function onOpen() {
     .addItem('▶ تشغيل التحديث الآن', 'runMismar')
     .addSeparator()
     .addItem('🔎 بحث في سجل النشاط', 'searchActivity')
+    .addItem('📆 تقرير حسب التاريخ (من - إلى)', 'buildDateRangeReport')
     .addItem('📊 التقرير الأسبوعي', 'buildWeeklyReport')
     .addItem('📅 التقرير الشهري', 'buildMonthlyReport')
     .addSeparator()
@@ -1380,30 +1125,31 @@ function initSheets() {
     [200, 130, 130, 180].forEach((w, i) => lv.setColumnWidth(i + 1, w)); lv.setFrozenRows(1);
   }
 
-  // ── CHANGE v8.1: ensure the three status tabs exist; migrate the legacy one.
+  // status tabs + daily performance
   const legacy = ss.getSheetByName(CFG.SH_NOTREADY);
-  if (legacy && !ss.getSheetByName(CFG.SH_OTHER)) {
-    legacy.setName(CFG.SH_OTHER);   // preserve position; content is regenerated each run
-  }
+  if (legacy && !ss.getSheetByName(CFG.SH_OTHER)) legacy.setName(CFG.SH_OTHER);
   getOrCreateSheet_(ss, CFG.SH_DELIVERED);
   getOrCreateSheet_(ss, CFG.SH_READY);
   getOrCreateSheet_(ss, CFG.SH_OTHER);
+  getOrCreateSheet_(ss, CFG.SH_DAILY);
 
-  auditSheet_();      // create / migrate the activity log to the 13-col schema
-  State.sheet_();     // create the hidden state sheet
+  // ── CHANGE v8.2: remove the retired dashboard / supervisors-performance / state sheets
+  [CFG.SH_DASH_OLD, CFG.SH_PERF_OLD, CFG.SH_STATE_OLD].forEach(name => {
+    const s = ss.getSheetByName(name); if (s) { try { ss.deleteSheet(s); } catch (e) {} }
+  });
+
+  ActivityLog.sheet();   // create/migrate the one-row-per-order log
 
   alertSafe_('تم الإعداد!\n\n1) احفظ التوكن من «حفظ التوكن (آمن)»\n2) أضف المراكز وP1/P2 في Matrix\n' +
              '3) أضف الإجازات عند الحاجة\n4) شغّل «تشغيل التحديث الآن»\n5) فعّل التشغيل التلقائي\n\n' +
-             'تبويبات الحالة الجديدة: «الطلبات تم التسليم» / «الطلبات الجاهزة» / «طلبات أخرى».');
+             'ملاحظة: سجل النشاط أصبح سطرًا واحدًا لكل طلب، وAHT يبدأ من «تم التسليم» فقط.');
 }
 
 /* ════════════════════════════ UI-SAFE MESSAGING ════════════════════════════ */
-/** toast works in the editor/UI; in trigger context it is a harmless no-op. */
 function notify_(msg) {
   try { SpreadsheetApp.getActive().toast(msg, 'مسمار', 6); } catch (e) {}
   console.log('[notify] ' + msg);
 }
-/** alert is only safe from menu-invoked functions; falls back to toast. */
 function alertSafe_(msg) {
   try { SpreadsheetApp.getUi().alert(msg); } catch (e) { notify_(msg); }
 }
