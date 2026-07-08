@@ -30,7 +30,7 @@ vm.createContext(ctx);
 // const/function bindings aren't auto-attached to the vm global — export them explicitly
 const shim = '\n;globalThis.__D = s => new Date(s);' +   // build Dates INSIDE the vm (instanceof)
   '\n;Object.assign(globalThis,{CFG,LG,Util,Api,ActivityLog,LOG_COLS,LOG_HEADERS,ST_QUEUE,ST_DONE,' +
-  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_,normalizeDate_,rangeFunnel_,logAgent_});';
+  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_,normalizeDate_,rangeFunnel_,logAgent_,mapOldHeader_,collapseOldRow_,buildHistRow_});';
 vm.runInContext(src + shim, ctx);
 
 let pass = 0, fail = 0;
@@ -139,13 +139,15 @@ ctx.ActivityLog.allRows = () => [
   mkFull('4', 'Sara',  'C2', '2026-07-01 09:00', '',                  '',                  '', 'قيد الطابور'), // received only
   mkFull('5', 'Ahmed', 'C1', '2026-07-05 09:00', '2026-07-05 10:00', '2026-07-05 10:30', 30, 'مكتمل'),        // out of the 07-01 window
 ];
+// COHORT semantics: cohort = orders whose FIRST (arrival) is in the window; of those,
+// how many delivered / completed. Monotonic: received ≥ delivered ≥ completed.
 const fn = ctx.rangeFunnel_('2026-07-01', '2026-07-01');
-eq('funnel Ahmed received', fn.byAgent.Ahmed.received, 2);   // orders 1,2 (3 arrived 06-20, 5 on 07-05)
-eq('funnel Ahmed delivered', fn.byAgent.Ahmed.delivered, 3); // orders 1,2,3 delivered on 07-01
-eq('funnel Ahmed completed', fn.byAgent.Ahmed.completed, 2); // orders 1,3 done on 07-01
-eq('funnel Ahmed avg', fn.byAgent.Ahmed.avg, 50);            // (40+60)/2
+eq('funnel Ahmed received', fn.byAgent.Ahmed.received, 2);   // rows 1,2 arrived 07-01 (3 arrived 06-20, 5 on 07-05)
+eq('funnel Ahmed delivered', fn.byAgent.Ahmed.delivered, 2); // row1 done⇒delivered, row2 has delivered ts
+eq('funnel Ahmed completed', fn.byAgent.Ahmed.completed, 1); // only row1 is done
+eq('funnel Ahmed avg', fn.byAgent.Ahmed.avg, 40);            // only row1 (mins 40); row3 excluded (arrived 06-20)
 eq('funnel Sara received', fn.byAgent.Sara.received, 1);
-eq('funnel totals', [fn.totals.received, fn.totals.delivered, fn.totals.completed], [3, 3, 2]);
+eq('funnel monotonic totals', [fn.totals.received, fn.totals.delivered, fn.totals.completed], [3, 2, 1]);
 eq('funnel center C1 received', fn.byLoc.C1.received, 2);
 
 // 9b) date parsing must survive the JS toString format Sheets stored (all-zero bug)
@@ -172,6 +174,35 @@ eq('agent numeric→matrix P1', ctx.logAgent_(rowWith('641514', 'C1'), mtx), 'Ah
 eq('agent auto→matrix P1', ctx.logAgent_(rowWith('النظام تلقائي', 'C2'), mtx), 'Omar');
 eq('agent numeric, no matrix→dash', ctx.logAgent_(rowWith('641514', 'Unknown'), mtx), '—'); // never a bare number
 eq('agent empty→dash', ctx.logAgent_(rowWith('', 'Unknown'), mtx), '—');
+
+// 11) consolidation of old logs (both schemas) → one-row-per-order
+// v8.1 action-log header
+const H81 = ['الوقت', 'المصدر', 'نوع الإجراء', 'رقم الاوردر', 'رقم الفاتورة', 'المركز', 'من حالة', 'إلى حالة', 'المنفّذ', 'مدة المعالجة (دقائق)', 'وقت إضافة الفاتورة', 'وقت إضافة مورد الصرف', 'ملاحظة'];
+const c81 = ctx.mapOldHeader_(H81);
+eq('map v8.1 oid col', c81.oid, 3);
+eq('map v8.1 actor col', c81.actor, 8);
+eq('map v8.1 supplier col', c81.supplier, 11);
+// v8.0 original header (different layout — order id at col 2, actor at col 4)
+const H80 = ['الوقت', 'المركز', 'رقم الاوردر', 'رقم الفاتورة', 'P1 المسؤول التنفيذي', 'حالة الاوردر', 'جاهز؟', 'AHT تنظر', 'ملاحظة'];
+const c80 = ctx.mapOldHeader_(H80);
+eq('map v8.0 oid col', c80.oid, 2);
+eq('map v8.0 actor col', c80.actor, 4);
+eq('map v8.0 status col', c80.status, 5);
+
+// collapse: an order that entered, got delivered, then settled across two rows
+const byOrder = {};
+const tzc = 'Asia/Riyadh';
+// v8.1 rows: دخول للطابور, then تمت التسوية (with delivered status + mins + supplier time)
+ctx.collapseOldRow_(byOrder, '5001', ['2026-06-20 09:00', 'API', 'دخول للطابور', '5001', '77', 'مركز أ', '', 'جاهز', 'النظام تلقائي', '', '', '', 'x'], c81, tzc);
+ctx.collapseOldRow_(byOrder, '5001', ['2026-06-20 10:30', 'API', 'تمت التسوية', '5001', '77', 'مركز أ', 'تم التسليم', 'تم التسليم', 'Ahmed', 40, '', '2026-06-20 10:30', 'y'], c81, tzc);
+const hist = ctx.buildHistRow_('5001', byOrder['5001']);
+eq('hist first (earliest)', hist[LG.FIRST], '2026-06-20 09:00');
+eq('hist delivered', hist[LG.DELIVERED], '2026-06-20 10:30');
+eq('hist supplier', hist[LG.SUPPLIER], '2026-06-20 10:30');
+eq('hist mins', hist[LG.MINS], 40);
+eq('hist state done', hist[LG.STATE], ctx.ST_DONE);
+eq('hist actor (not auto)', hist[LG.ACTIVE], 'Ahmed');
+eq('hist center', hist[LG.LOC], 'مركز أ');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

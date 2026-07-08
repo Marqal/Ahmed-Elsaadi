@@ -69,6 +69,7 @@ const CFG = {
   SH_LOG:      'سجل النشاط',                // now: ONE ROW PER ORDER
   SH_LOG_ARC:  'سجل النشاط - ارشيف',
   SH_LOG_OLD:  'سجل النشاط - قديم',         // ── CHANGE v8.2: parked pre-migration log
+  SH_LOG_HIST: 'سجل نشاط قديم',             // ── CHANGE v8.3: consolidated historical (all old logs merged)
   SH_SEARCH:   'بحث النشاط',
   SH_LOG_W:    'لوج اسبوعي',
   SH_LOG_M:    'لوج شهري',
@@ -687,15 +688,21 @@ const ActivityLog = {
    *  read the OLD schema with new indices → order id showed up in the «المشرف»
    *  column. sheet() guarantees the new order-keyed layout. */
   allRows() {
-    const out = [];
     const ss = SpreadsheetApp.getActive();
-    const live = this.sheet();   // ← ensures migration to the new schema
-    if (live.getLastRow() >= 2) out.push(...live.getRange(2, 1, live.getLastRow() - 1, LOG_COLS).getValues());
-    const arc = ss.getSheetByName(CFG.SH_LOG_ARC);
-    // only include the archive if it is in the NEW schema (skip a stale v8.1 archive)
-    if (arc && arc.getLastRow() >= 2 && String(arc.getRange(1, 1).getValue()) === LOG_HEADERS[0]) {
-      out.push(...arc.getRange(2, 1, arc.getLastRow() - 1, LOG_COLS).getValues());
-    }
+    const out = [], seen = new Set();
+    // read a NEW-schema sheet, de-duplicating by order id (first source wins)
+    const push = sh => {
+      if (!sh || sh.getLastRow() < 2) return;
+      if (String(sh.getRange(1, 1).getValue()) !== LOG_HEADERS[0]) return;   // skip old-schema sheets
+      sh.getRange(2, 1, sh.getLastRow() - 1, LOG_COLS).getValues().forEach(r => {
+        const id = String(r[LG.OID] || '');
+        if (!id || seen.has(id)) return;
+        seen.add(id); out.push(r);
+      });
+    };
+    push(this.sheet());                          // live log (authoritative) — also migrates
+    push(ss.getSheetByName(CFG.SH_LOG_ARC));     // new-schema archive (recent completed)
+    push(ss.getSheetByName(CFG.SH_LOG_HIST));    // ── v8.3: consolidated historical (all old logs)
     return out;
   }
 };
@@ -711,6 +718,114 @@ function logAgent_(row, matrix) {
     a = matrix[loc].p1;
   }
   return a && !/^\d+$/.test(a) ? a : '—';   // never return a bare number as a name
+}
+
+/* ════════════════════════════ CONSOLIDATE OLD LOGS (v8.3) ════════════════════════════
+ * Merge EVERY old-format activity-log sheet (both the v8.0 and v8.1 layouts, plus
+ * the old-schema archive) into ONE clean, order-keyed, date-sorted «سجل نشاط قديم».
+ * The range report then includes it, so totals reflect ALL history — not just the
+ * ~hundreds of orders currently in the live queue. Data is preserved: raw source
+ * sheets are hidden (not deleted) as a backup. Menu: «🧩 دمج السجلات القديمة». */
+
+/** Map an old log's header row to column indices by keyword (schema-agnostic). */
+function mapOldHeader_(header) {
+  const find = kws => { for (let i = 0; i < header.length; i++) { const h = String(header[i] || ''); if (kws.some(k => h.indexOf(k) > -1)) return i; } return -1; };
+  return {
+    oid:      find(['رقم الاوردر', 'رقم الأوردر', 'الاوردر', 'الأوردر', 'رقم الطلب']),
+    iid:      find(['رقم الفاتورة', 'الفاتورة']),
+    loc:      find(['المركز', 'اسم المركز']),
+    actor:    find(['المنفّذ', 'المنفذ', 'المسؤول', 'P1']),
+    status:   find(['إلى حالة', 'الى حالة', 'حالة الاوردر', 'الحالة الحالية']),
+    action:   find(['نوع الإجراء', 'الإجراء']),
+    time:     find(['الوقت', 'التاريخ']),
+    mins:     find(['مدة']),
+    supplier: find(['مورد الصرف']),
+    cost:     find(['إضافة الفاتورة', 'وقت إضافة الفاتورة'])
+  };
+}
+
+/** Fold one old row into the per-order accumulator. */
+function collapseOldRow_(byOrder, oid, r, col, tz) {
+  const o = byOrder[oid] || (byOrder[oid] = { iid: '', loc: '', actor: '', status: '', first: '', ready: '', delivered: '', supplier: '', cost: '', mins: '', state: ST_QUEUE });
+  const g = i => i >= 0 ? r[i] : '';
+  const time = Util.toDisplay(g(col.time), tz);
+  const action = String(g(col.action) || ''), status = String(g(col.status) || '');
+  const iid = String(g(col.iid) || '').trim(); if (iid) o.iid = iid;
+  const loc = String(g(col.loc) || '').trim(); if (loc) o.loc = loc;
+  const actor = String(g(col.actor) || '').trim();
+  if (actor && actor !== '—' && actor.indexOf('تلقائي') === -1 && actor.indexOf('النظام') === -1 && actor.indexOf('Automated') === -1) o.actor = actor;
+  if (status) o.status = status;
+  if (col.cost >= 0) { const c = Util.toDisplay(g(col.cost), tz); if (c && !o.cost) o.cost = c; }
+  if (time && (!o.first || time < o.first)) o.first = time;                       // earliest = queue entry
+  if ((action.indexOf('جاهز') > -1 || status.indexOf('جاهز') > -1) && !o.ready) o.ready = time;
+  if (action.indexOf('تسليم') > -1 || status.indexOf('تم التسليم') > -1) { if (time && (!o.delivered || time > o.delivered)) o.delivered = time; }
+  const supT = col.supplier >= 0 ? Util.toDisplay(g(col.supplier), tz) : '';
+  if (supT) { o.supplier = supT; o.state = ST_DONE; }
+  if (action.indexOf('تسوية') > -1) { if (time && (!o.supplier || time > o.supplier)) o.supplier = time; o.state = ST_DONE; const m = g(col.mins); if (m !== '' && m != null) o.mins = m; }
+  if ((o.mins === '' || o.mins == null) && col.mins >= 0) { const m = g(col.mins); if (m !== '' && m != null && Number(m) > 0) o.mins = m; }
+}
+
+function buildHistRow_(oid, o) {
+  const out = new Array(LOG_COLS).fill('');
+  out[LG.OID] = oid; out[LG.IID] = o.iid; out[LG.LOC] = o.loc; out[LG.ACTIVE] = o.actor; out[LG.STATUS] = o.status;
+  out[LG.COST] = o.cost; out[LG.FIRST] = o.first; out[LG.READY] = o.ready; out[LG.DELIVERED] = o.delivered; out[LG.SUPPLIER] = o.supplier;
+  out[LG.MINS] = o.mins; out[LG.STATE] = o.supplier ? ST_DONE : (o.state || ST_QUEUE);
+  out[LG.UPDATED] = o.supplier || o.delivered || o.first;
+  return out;
+}
+
+/** Menu action: consolidate all old logs → «سجل نشاط قديم». */
+function consolidateOldLogs() {
+  const ss = SpreadsheetApp.getActive();
+  const cfg = getConfig_();
+  const live = ActivityLog.read();                       // migrates + gives current order ids
+  const liveIds = new Set(Object.keys(live.idx));
+
+  // sources = any sheet named like a log, in the OLD schema, excluding the live log & our target
+  const sources = ss.getSheets().filter(sh => {
+    const n = sh.getName();
+    if (n === CFG.SH_LOG || n === CFG.SH_LOG_HIST) return false;
+    if (n.indexOf('سجل') === -1) return false;
+    if (sh.getLastColumn() >= 1 && String(sh.getRange(1, 1).getValue()) === LOG_HEADERS[0]) return false; // skip NEW-schema
+    return true;
+  });
+
+  const byOrder = {};
+  let rawRows = 0;
+  sources.forEach(sh => {
+    const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return;
+    const header = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+    const col = mapOldHeader_(header);
+    if (col.oid < 0) return;                              // unrecognised → skip (leave untouched)
+    sh.getRange(2, 1, lastRow - 1, lastCol).getValues().forEach(r => {
+      const oid = String(r[col.oid] || '').trim(); if (!oid) return;
+      rawRows++; collapseOldRow_(byOrder, oid, r, col, cfg.tz);
+    });
+  });
+
+  // one row per historical order NOT already tracked in the live log
+  const rows = Object.keys(byOrder).filter(oid => !liveIds.has(oid)).map(oid => buildHistRow_(oid, byOrder[oid]));
+  rows.sort((a, b) => String(a[LG.FIRST]).localeCompare(String(b[LG.FIRST])));   // sort by date
+
+  // write the consolidated tab
+  let sh = ss.getSheetByName(CFG.SH_LOG_HIST) || ss.insertSheet(CFG.SH_LOG_HIST);
+  sh.clear();
+  sh.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]).setBackground('#5d4037').setFontColor('#fff').setFontWeight('bold');
+  sh.setFrozenRows(1);
+  [110, 110, 190, 160, 150, 150, 155, 150, 150, 165, 130, 110, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  if (rows.length) {
+    const rng = sh.getRange(2, 1, rows.length, LOG_COLS);
+    rng.setNumberFormat('@');
+    sh.getRange(2, LG.MINS + 1, rows.length, 1).setNumberFormat('0');
+    rng.setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+  }
+
+  // preserve raw sources but hide them to declutter
+  sources.forEach(s => { try { s.hideSheet(); } catch (e) {} });
+
+  alertSafe_(`تم دمج ${sources.length} سجل قديم (${rawRows} سطر) → ${rows.length} طلب في «${CFG.SH_LOG_HIST}» مرتبة بالتاريخ.\n` +
+             'السجلات القديمة أصبحت مخفية (محفوظة كنسخة احتياطية). التقارير الآن تشمل كل الداتا.');
 }
 
 /** Aggregate COMPLETED orders whose supplier-added date is within [fromStr,toStr]
@@ -1060,12 +1175,12 @@ function buildDateRangeReport() {
   SpreadsheetApp.setActiveSheet(SpreadsheetApp.getActive().getSheetByName(CFG.SH_RANGE));
 }
 
-/** ── CHANGE v8.3: funnel per agent + per center for a date range, using the
- *  one-row log's milestone dates:
- *    received  = وقت الدخول للطابور within range   (كام أوردر وصله)
- *    delivered = وقت التسليم within range           (كام تم التسليم)
- *    completed = وقت إضافة مورد الصرف within range  (كام أنجز) + handling avg
- *  Counts are event-in-window so daily/weekly/monthly are directly comparable. */
+/** ── CHANGE v8.3: COHORT funnel per agent + per center for a date range.
+ *  We take the orders that ARRIVED (دخلوا الطابور) within the range, then of THOSE:
+ *    received  = عدد الطلبات التي وصلت في الفترة
+ *    delivered = كم منها تم تسليمه       (subset ⇒ received ≥ delivered)
+ *    completed = كم منها أُنجز (مورد الصرف) (subset ⇒ delivered ≥ completed) + متوسط المعالجة
+ *  Monotonic funnel — matches «وصله كام … كام منهم تم التسليم … وأنجز منهم قد ايه». */
 function rangeFunnel_(fromStr, toStr) {
   const tz = getConfig_().tz;
   const inRange = v => { const d = Util.datePrefix(v, tz); return d && d >= fromStr && d <= toStr; };
@@ -1073,13 +1188,16 @@ function rangeFunnel_(fromStr, toStr) {
   const byAgent = {}, byLoc = {};
   const T = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 };
   ActivityLog.allRows().forEach(r => {
-    const agent = logAgent_(r, matrix);   // ── FIX v8.3: robust supervisor (never an order id)
+    if (!inRange(r[LG.FIRST])) return;    // cohort = orders that arrived in the window
+    const agent = logAgent_(r, matrix);   // robust supervisor (never an order id)
     const loc = String(r[LG.LOC] || '—') || '—';
     const a = byAgent[agent] || (byAgent[agent] = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 });
     const l = byLoc[loc] || (byLoc[loc] = { received: 0, delivered: 0, completed: 0 });
-    if (inRange(r[LG.FIRST]))     { a.received++;  l.received++;  T.received++; }
-    if (inRange(r[LG.DELIVERED])) { a.delivered++; l.delivered++; T.delivered++; }
-    if (r[LG.STATE] === ST_DONE && inRange(r[LG.SUPPLIER])) {
+    const done = r[LG.STATE] === ST_DONE;
+    const delivered = done || !!String(r[LG.DELIVERED] || '').trim();   // done ⇒ was delivered (monotonic)
+    a.received++; l.received++; T.received++;
+    if (delivered) { a.delivered++; l.delivered++; T.delivered++; }
+    if (done) {
       a.completed++; l.completed++; T.completed++;
       const mins = Number(r[LG.MINS]) || 0;
       if (mins > 0) { a.sumMins += mins; a.cnt++; T.sumMins += mins; T.cnt++; }
@@ -1106,14 +1224,14 @@ function buildRangeReport_(fromStr, toStr, title, sheetName) {
     .setBackground(CFG.C_HDR).setFontColor('#fff').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setRowHeight(1, 44);
   sh.getRange(2, 1, 1, 6).merge().setValue(
-    `وصله ${totals.received} · تم التسليم ${totals.delivered} · أنجز ${totals.completed} · ` +
+    `وصله ${totals.received} · منها تم التسليم ${totals.delivered} · منها أُنجز ${totals.completed} · ` +
     `متوسط المعالجة ${totals.avg ? Util.fmtDuration(totals.avg) : '—'} · حُدّث ${nowStr}`)
     .setBackground('#162032').setFontColor('#90caf9').setFontSize(10).setHorizontalAlignment('center');
   sh.setRowHeight(2, 24);
 
-  // per-agent funnel
+  // per-agent funnel (cohort: of the orders received in the window)
   let R = 4;
-  sh.getRange(R, 1, 1, 6).setValues([['المشرف', 'وصله (دخل الطابور)', 'تم التسليم', 'أنجز (مكتمل)', 'متوسط المعالجة', 'نسبة الإنجاز']])
+  sh.getRange(R, 1, 1, 6).setValues([['المشرف', 'وصله (دخل الطابور)', 'منها تم التسليم', 'منها أُنجز', 'متوسط المعالجة', 'نسبة الإنجاز']])
     .setBackground('#1976d2').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
   const agents = Object.keys(byAgent).filter(a => a !== '—')
     .sort((a, b) => (byAgent[b].received - byAgent[a].received) || (byAgent[b].completed - byAgent[a].completed));
@@ -1135,7 +1253,7 @@ function buildRangeReport_(fromStr, toStr, title, sheetName) {
 
   // per-center funnel
   R += 2;
-  sh.getRange(R, 1, 1, 4).setValues([['المركز', 'وصله', 'تم التسليم', 'أنجز']])
+  sh.getRange(R, 1, 1, 4).setValues([['المركز', 'وصله', 'منها تم التسليم', 'منها أُنجز']])
     .setBackground('#6a1b9a').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
   const locs = Object.keys(byLoc).filter(l => l !== '—').sort((a, b) => byLoc[b].received - byLoc[a].received);
   if (locs.length) {
@@ -1213,6 +1331,7 @@ function onOpen() {
     .addItem('▶ تشغيل التحديث الآن', 'runMismar')
     .addSeparator()
     .addItem('🔎 بحث في سجل النشاط', 'searchActivity')
+    .addItem('🧩 دمج السجلات القديمة', 'consolidateOldLogs')
     .addItem('📆 تقرير حسب التاريخ (من - إلى)', 'buildDateRangeReport')
     .addItem('📊 تقرير اليوم', 'buildTodayReport')
     .addItem('📊 التقرير الأسبوعي', 'buildWeeklyReport')

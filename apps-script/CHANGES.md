@@ -1,6 +1,34 @@
 # مسمار — Invoice Audit Monitoring System
 
-## v8.3 — analytic reports + Arabic-date fix (latest)
+## v8.3 — consolidate history + cohort funnel (latest)
+
+**Why the report total was too low (e.g. 368).** The report only reads the current
+one-row log + the new-format archive. All the real history lived in **several
+old-format log tabs** (`سجل النشاط - قديم` = v8.1 layout, `سجل نشاط قديم 2` = the
+original v8.0 layout with *different* columns, and an old-format `- ارشيف` with
+US-style `6/16/2026` dates). Those use different column positions, so the report
+skips them (reading them with the new positions is what caused the earlier
+order-id-as-supervisor corruption). Hence only the ~hundreds currently in the
+queue were counted.
+
+**Fix — new menu «🧩 دمج السجلات القديمة».** It merges **every** old log (both
+layouts + old archive) into one clean, **date-sorted** `سجل نشاط قديم` tab in the
+new order-keyed format, and the report now includes it (de-duped by order id, live
+wins). **Data is preserved** — the raw source tabs are hidden as a backup, not
+deleted. Run it once; then the reports reflect all history.
+
+**Report is now a monotonic COHORT funnel.** Previously counts were event-in-window
+so «أنجز» could exceed «تم التسليم». Now each report takes the orders that
+**arrived** (دخلوا الطابور) in the range, and of *those* how many were delivered
+and completed — so **وصله ≥ منها تم التسليم ≥ منها أُنجز**, matching «وصله كام …
+كام منهم … وأنجز منهم قد ايه».
+
+**Deploy:** paste `Code.gs`, run «▶ تشغيل التحديث الآن» once, then
+«🧩 دمج السجلات القديمة» once, then open any report.
+
+---
+
+## v8.3 — analytic reports + Arabic-date fix
 
 **Report showed all-zeros + messy log — fixed.** Google Sheets had coerced the
 log's date strings into real Date values (text format was applied *after*
@@ -136,5 +164,5 @@ the pure logic (classification, overnight business-minutes, delivery-based AHT,
 supplier extraction, cost fallback, date-range report aggregation):
 
 ```bash
-cd apps-script && node test_logic.js      # 52 passed, 0 failed
+cd apps-script && node test_logic.js      # 65 passed, 0 failed
 ```
