@@ -20,13 +20,15 @@ const Utilities = {
 const noop = () => {};
 const ctx = {
   console, Utilities,
-  SpreadsheetApp: {}, UrlFetchApp: {}, PropertiesService: {}, LockService: {}, ScriptApp: {}, Session: {},
+  // getActive() returns a stub whose getSheetByName yields null, so readMatrix_() → {}
+  SpreadsheetApp: { getActive: () => ({ getSheetByName: () => null }) },
+  UrlFetchApp: {}, PropertiesService: {}, LockService: {}, ScriptApp: {}, Session: {},
 };
 vm.createContext(ctx);
 // const/function bindings aren't auto-attached to the vm global — export them explicitly
 const shim = '\n;globalThis.__D = s => new Date(s);' +   // build Dates INSIDE the vm (instanceof)
   '\n;Object.assign(globalThis,{CFG,LG,Util,Api,ActivityLog,LOG_COLS,LOG_HEADERS,ST_QUEUE,ST_DONE,' +
-  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_,normalizeDate_,rangeFunnel_});';
+  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_,normalizeDate_,rangeFunnel_,logAgent_});';
 vm.runInContext(src + shim, ctx);
 
 let pass = 0, fail = 0;
@@ -143,6 +145,15 @@ eq('funnel Ahmed avg', fn.byAgent.Ahmed.avg, 50);            // (40+60)/2
 eq('funnel Sara received', fn.byAgent.Sara.received, 1);
 eq('funnel totals', [fn.totals.received, fn.totals.delivered, fn.totals.completed], [3, 3, 2]);
 eq('funnel center C1 received', fn.byLoc.C1.received, 2);
+
+// 10) supervisor resolver — the fix for «المشرف» showing order/invoice numbers
+const mtx = { 'C1': { p1: 'Ahmed', p2: 'Sara' }, 'C2': { p1: 'Omar', p2: '' } };
+function rowWith(active, loc) { const r = new Array(ctx.LOG_COLS).fill(''); r[LG.ACTIVE] = active; r[LG.LOC] = loc; return r; }
+eq('agent keeps real name', ctx.logAgent_(rowWith('Ahmed', 'C1'), mtx), 'Ahmed');
+eq('agent numeric→matrix P1', ctx.logAgent_(rowWith('641514', 'C1'), mtx), 'Ahmed');       // order-id leak → P1
+eq('agent auto→matrix P1', ctx.logAgent_(rowWith('النظام تلقائي', 'C2'), mtx), 'Omar');
+eq('agent numeric, no matrix→dash', ctx.logAgent_(rowWith('641514', 'Unknown'), mtx), '—'); // never a bare number
+eq('agent empty→dash', ctx.logAgent_(rowWith('', 'Unknown'), mtx), '—');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

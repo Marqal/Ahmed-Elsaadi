@@ -2,6 +2,18 @@
 
 ## v8.3 — analytic reports + Arabic-date fix (latest)
 
+**Supervisor column showed order/invoice numbers — fixed.** The report reader
+(`ActivityLog.allRows`) read the log sheet *directly*, bypassing the schema
+migration. If you opened a report before `runMismar` had migrated the log, it read
+the **old** multi-row schema with the **new** column indices, so the order id
+landed in the «المشرف» column and every metric was 0. Now `allRows()` runs the
+migration first, and `logAgent_()` resolves the supervisor defensively (a name is
+never purely numeric → falls back to the assigned auditor from the matrix by
+center, else «—»). A stale v8.1 archive sheet (same name, old schema) is parked so
+schemas never mix. **After updating, just run «▶ تشغيل التحديث الآن» once, then the
+report.**
+
+
 **Date-prompt bug fixed.** The «صيغة التاريخ غير صحيحة» popup happened because the
 prompt received **Arabic-Indic digits** (`٢٠٢٦-٠٧-٠١`) or invisible RTL marks from
 an Arabic keyboard, which the strict `\d` check rejected. `normalizeDate_()` now
@@ -104,5 +116,5 @@ the pure logic (classification, overnight business-minutes, delivery-based AHT,
 supplier extraction, cost fallback, date-range report aggregation):
 
 ```bash
-cd apps-script && node test_logic.js      # 40 passed, 0 failed
+cd apps-script && node test_logic.js      # 45 passed, 0 failed
 ```

@@ -505,9 +505,11 @@ const ActivityLog = {
         if (loc) o.loc = loc;
         if (actor && actor !== '—' && actor !== 'النظام تلقائي') o.actor = actor;
         if (toStatus) o.status = toStatus;
-        if (action.indexOf('طابور') > -1 && !o.first) o.first = time;
-        if (action.indexOf('جاهز') > -1 && !o.ready) o.ready = time;
-        if (action.indexOf('تسليم') > -1) { o.delivered = time; o.status = o.status || 'تم التسليم'; }
+        // rows are appended chronologically → first touch = queue entry (received)
+        if (!o.first) o.first = time;
+        if ((action.indexOf('جاهز') > -1 || toStatus.indexOf('جاهز') > -1) && !o.ready) o.ready = time;
+        // delivery may be an explicit action OR a status-change into «تم التسليم»
+        if (action.indexOf('تسليم') > -1 || toStatus.indexOf('تم التسليم') > -1) { o.delivered = time; o.status = 'تم التسليم'; }
         if (action.indexOf('تسوية') > -1) { o.supplier = time; o.state = ST_DONE; if (mins !== '' && mins != null) o.mins = mins; }
       });
     }
@@ -619,32 +621,59 @@ const ActivityLog = {
   archive_(rows) {
     const ss = SpreadsheetApp.getActive();
     let arc = ss.getSheetByName(CFG.SH_LOG_ARC);
+    // ── FIX v8.3: an archive left by v8.1 shares this name but has the OLD schema.
+    // Park it so we never mix schemas in one sheet (which would corrupt reports).
+    if (arc && String(arc.getRange(1, 1).getValue()) !== LOG_HEADERS[0]) {
+      try { arc.setName(CFG.SH_LOG_ARC + ' - قديم'); } catch (e) {}
+      arc = null;
+    }
     if (!arc) { arc = ss.insertSheet(CFG.SH_LOG_ARC); arc.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]); arc.setFrozenRows(1); }
     arc.getRange(arc.getLastRow() + 1, 1, rows.length, LOG_COLS)
        .setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
   },
 
-  /** All log rows (live + archive) as arrays — used by reports/daily. */
+  /** All log rows (live + archive) as arrays — used by reports/daily.
+   *  ── FIX v8.3: the live log is fetched via sheet() so it is MIGRATED to the new
+   *  schema first. Reading it raw (as before) meant a report run before runMismar
+   *  read the OLD schema with new indices → order id showed up in the «المشرف»
+   *  column. sheet() guarantees the new order-keyed layout. */
   allRows() {
     const out = [];
     const ss = SpreadsheetApp.getActive();
-    [CFG.SH_LOG, CFG.SH_LOG_ARC].forEach(name => {
-      const sh = ss.getSheetByName(name);
-      if (sh && sh.getLastRow() >= 2) out.push(...sh.getRange(2, 1, sh.getLastRow() - 1, LOG_COLS).getValues());
-    });
+    const live = this.sheet();   // ← ensures migration to the new schema
+    if (live.getLastRow() >= 2) out.push(...live.getRange(2, 1, live.getLastRow() - 1, LOG_COLS).getValues());
+    const arc = ss.getSheetByName(CFG.SH_LOG_ARC);
+    // only include the archive if it is in the NEW schema (skip a stale v8.1 archive)
+    if (arc && arc.getLastRow() >= 2 && String(arc.getRange(1, 1).getValue()) === LOG_HEADERS[0]) {
+      out.push(...arc.getRange(2, 1, arc.getLastRow() - 1, LOG_COLS).getValues());
+    }
     return out;
   }
 };
+
+/** ── FIX v8.3: resolve the responsible supervisor for a log row. A supervisor
+ *  name is never purely numeric, so if the stored value is empty / «النظام تلقائي»
+ *  / an order-id leak, fall back to the assigned auditor (matrix P1) by center.
+ *  This is what stops the «المشرف» column from showing order/invoice numbers. */
+function logAgent_(row, matrix) {
+  let a = String(row[LG.ACTIVE] || '').trim();
+  const loc = String(row[LG.LOC] || '').trim();
+  if ((!a || a === '—' || a === 'النظام تلقائي' || /^\d+$/.test(a)) && matrix && matrix[loc] && matrix[loc].p1) {
+    a = matrix[loc].p1;
+  }
+  return a && !/^\d+$/.test(a) ? a : '—';   // never return a bare number as a name
+}
 
 /** Aggregate COMPLETED orders whose supplier-added date is within [fromStr,toStr]
  *  (yyyy-MM-dd inclusive) → per-supervisor {count, sumMins, cnt, avg}. */
 function completedByActor_(fromStr, toStr) {
   const out = {};
+  const matrix = readMatrix_();
   ActivityLog.allRows().forEach(r => {
     if (r[LG.STATE] !== ST_DONE) return;
     const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
     if (!dp || dp < fromStr || dp > toStr) return;
-    const actor = String(r[LG.ACTIVE] || '—') || '—';
+    const actor = logAgent_(r, matrix);
     const mins = Number(r[LG.MINS]) || 0;
     const o = out[actor] || (out[actor] = { count: 0, sumMins: 0, cnt: 0 });
     o.count++; if (mins > 0) { o.sumMins += mins; o.cnt++; }
@@ -989,10 +1018,11 @@ function buildDateRangeReport() {
  *  Counts are event-in-window so daily/weekly/monthly are directly comparable. */
 function rangeFunnel_(fromStr, toStr) {
   const inRange = v => { const d = String(v || '').substr(0, 10); return d && d >= fromStr && d <= toStr; };
+  const matrix = readMatrix_();
   const byAgent = {}, byLoc = {};
   const T = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 };
   ActivityLog.allRows().forEach(r => {
-    const agent = String(r[LG.ACTIVE] || '—') || '—';
+    const agent = logAgent_(r, matrix);   // ── FIX v8.3: robust supervisor (never an order id)
     const loc = String(r[LG.LOC] || '—') || '—';
     const a = byAgent[agent] || (byAgent[agent] = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 });
     const l = byLoc[loc] || (byLoc[loc] = { received: 0, delivered: 0, completed: 0 });
