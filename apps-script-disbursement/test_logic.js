@@ -12,7 +12,7 @@ const Utilities = {
 };
 const ctx = { console, Utilities, SpreadsheetApp: {}, UrlFetchApp: {}, PropertiesService: {}, LockService: {} };
 vm.createContext(ctx);
-vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,Util,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,normalizeDate_});', ctx);
+vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,normalizeDate_,statusLabel_});', ctx);
 
 let pass = 0, fail = 0;
 const eq = (n, g, w) => { const ok = JSON.stringify(g) === JSON.stringify(w); console.log((ok ? '✅' : '❌') + ' ' + n + (ok ? '' : `  got=${JSON.stringify(g)} want=${JSON.stringify(w)}`)); ok ? pass++ : fail++; };
@@ -49,6 +49,27 @@ eq('date slash', ctx.normalizeDate_('2026/7/1'), '2026-07-01');
 
 // Util.datePrefix on a spend date
 eq('datePrefix', ctx.Util.datePrefix('2026-07-01', 'Asia/Riyadh'), '2026-07-01');
+
+// ── buildQuery must reproduce the CONFIRMED admin params
+const cfgPaid = { mode: 'paid', dateFrom: '2026-07-01', dateTo: '2026-07-31', locationIds: '862', supplierIds: '', statuses: ['1', '3'], rawQuery: '' };
+eq('buildQuery paid+loc', ctx.Api.buildQuery(cfgPaid, '1', 1),
+   'businessOrderTypes=B2B_business&fromPaidDate=2026-07-01&toPaidDate=2026-07-31&status=1&purchaseLocationsIds=862&offset=0&limit=100&page=1');
+const cfgSup = { mode: 'paid', dateFrom: '2026-07-01', dateTo: '2026-07-01', locationIds: '', supplierIds: '55', statuses: ['1'], rawQuery: '' };
+eq('buildQuery supplier id', ctx.Api.buildQuery(cfgSup, '1', 2),
+   'businessOrderTypes=B2B_business&fromPaidDate=2026-07-01&toPaidDate=2026-07-01&status=1&spendSupplierIds=55&offset=100&limit=100&page=2');
+const cfgUnpaid = { mode: 'unpaid', dateFrom: '', dateTo: '', locationIds: '', supplierIds: '', statuses: ['2'], rawQuery: '' };
+eq('buildQuery unpaid (no date)', ctx.Api.buildQuery(cfgUnpaid, '2', 1),
+   'businessOrderTypes=B2B_business&status=2&offset=0&limit=100&page=1');
+const cfgRaw = { rawQuery: 'businessOrderTypes=B2B_business&status=1&limit=10&page=1&offset=0' };
+eq('buildQuery RAW override strips paging', ctx.Api.buildQuery(cfgRaw, null, 3),
+   'businessOrderTypes=B2B_business&status=1&offset=200&limit=100&page=3');
+
+// status classification + label
+eq('parse status=1 → paid', ctx.parseInvoice_({ id: 1, status: 1 }).paid, true);
+eq('parse status=2 → unpaid', ctx.parseInvoice_({ id: 1, status: 2 }).paid, false);
+eq('parse status carried from query', ctx.parseInvoice_({ id: 1 }, '3').status, '3');
+eq('statusLabel 1', ctx.statusLabel_(1), 'تم الدفع');
+eq('statusLabel 3', ctx.statusLabel_('3'), 'الدفع بالأجل');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
