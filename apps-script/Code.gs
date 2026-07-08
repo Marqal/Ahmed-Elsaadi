@@ -1,8 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  نظام مراقبة الفواتير — مسمار  v8.2  (one-row log + delivery-based AHT)      ║
+ * ║  نظام مراقبة الفواتير — مسمار  v8.3  (analytic reports + Arabic-date fix)    ║
  * ║  Invoice Audit Monitoring System                                          ║
  * ║  Built on top of v8.x by Ahmed Elsaadi · feedback update                  ║
+ * ║                                                                            ║
+ * ║  v8.3: reports are now a per-agent FUNNEL (received→delivered→completed +   ║
+ * ║        avg handling + completion rate) for today/week/month/custom range;  ║
+ * ║        date prompts accept Arabic-Indic/Persian digits & pasted date-times ║
+ * ║        (normalizeDate_) — fixes the «صيغة التاريخ غير صحيحة» popup.          ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
  * ════════════════ WHAT CHANGED vs v8.1 (this update, per feedback) ════════════════
@@ -939,77 +944,129 @@ function renderDailyPerformance_(ss, records, onLeave, cfg) {
     [200, 130, 175, 120, 175, 120], { headerBg: '#1a237e' });
 }
 
-/* ════════════════════════════ REPORTS (from the one-row log) ════════════════════════════ */
+/* ════════════════════════════ REPORTS (analysis from the one-row log) ════════════════════════════ */
+function buildTodayReport()   { const c = getConfig_(); const d = Util.todayStr(c.tz); buildRangeReport_(d, d, 'تقرير اليوم', CFG.SH_RANGE); try { SpreadsheetApp.setActiveSheet(SpreadsheetApp.getActive().getSheetByName(CFG.SH_RANGE)); } catch (e) {} }
 function buildWeeklyReport()  { const c = getConfig_(); buildRangeReport_(Util.daysAgoStr(c.tz, 7),  Util.todayStr(c.tz), 'التقرير الأسبوعي', CFG.SH_LOG_W); }
 function buildMonthlyReport() { const c = getConfig_(); buildRangeReport_(Util.daysAgoStr(c.tz, 30), Util.todayStr(c.tz), 'التقرير الشهري',  CFG.SH_LOG_M); }
 
-/** ── CHANGE v8.2: pick a from/to date and build the report for that range. */
+/** ── FIX v8.3: robustly parse a user-typed date → 'YYYY-MM-DD'. Handles
+ *  Arabic-Indic (٠-٩) & Persian (۰-۹) digits, RTL/bidi marks, «.» «/» «\» separators,
+ *  single-digit m/d, and a trailing time (pasting "2026-07-01 09:12"). '' if bad.
+ *  This is what fixes the «صيغة التاريخ غير صحيحة» popup for Arabic keyboards. */
+function normalizeDate_(s) {
+  if (s == null) return '';
+  s = String(s)
+    .replace(/[\u0660-\u0669]/g, d => d.charCodeAt(0) - 0x0660)   // Arabic-Indic digits -> 0-9
+    .replace(/[\u06F0-\u06F9]/g, d => d.charCodeAt(0) - 0x06F0)   // Persian digits -> 0-9
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');    // strip bidi/RTL marks
+  s = s.replace(/[.\\\/]/g, '-');
+  const m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return '';
+  const mm = +m[2], dd = +m[3];
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return '';
+  return m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2);
+}
+
+/** ── CHANGE v8.3: pick a from/to date and build the analytic report for that range. */
 function buildDateRangeReport() {
   const ui = SpreadsheetApp.getUi();
-  const cfg = getConfig_();
-  const f = ui.prompt('تقرير حسب التاريخ', 'من تاريخ (YYYY-MM-DD):', ui.ButtonSet.OK_CANCEL);
+  const f = ui.prompt('تقرير حسب التاريخ', 'من تاريخ (مثال: 2026-07-01):', ui.ButtonSet.OK_CANCEL);
   if (f.getSelectedButton() !== ui.Button.OK) return;
-  const t = ui.prompt('تقرير حسب التاريخ', 'إلى تاريخ (YYYY-MM-DD):', ui.ButtonSet.OK_CANCEL);
+  const t = ui.prompt('تقرير حسب التاريخ', 'إلى تاريخ (مثال: 2026-07-08):', ui.ButtonSet.OK_CANCEL);
   if (t.getSelectedButton() !== ui.Button.OK) return;
-  const from = f.getResponseText().trim(), to = t.getResponseText().trim();
-  const ok = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
-  if (!ok(from) || !ok(to)) { ui.alert('صيغة التاريخ غير صحيحة. استخدم YYYY-MM-DD.'); return; }
+  const from = normalizeDate_(f.getResponseText()), to = normalizeDate_(t.getResponseText());
+  if (!from || !to) { ui.alert('صيغة التاريخ غير صحيحة.\nاكتب التاريخ بصيغة سنة-شهر-يوم، مثال: 2026-07-01'); return; }
   const lo = from <= to ? from : to, hi = from <= to ? to : from;
-  buildRangeReport_(lo, hi, `تقرير من ${lo} إلى ${hi}`, CFG.SH_RANGE);
+  buildRangeReport_(lo, hi, 'تقرير حسب التاريخ', CFG.SH_RANGE);
   SpreadsheetApp.setActiveSheet(SpreadsheetApp.getActive().getSheetByName(CFG.SH_RANGE));
 }
 
-/** Core report engine: aggregates COMPLETED orders (supplier added) in a date
- *  range into per-supervisor + per-center tables. */
+/** ── CHANGE v8.3: funnel per agent + per center for a date range, using the
+ *  one-row log's milestone dates:
+ *    received  = وقت الدخول للطابور within range   (كام أوردر وصله)
+ *    delivered = وقت التسليم within range           (كام تم التسليم)
+ *    completed = وقت إضافة مورد الصرف within range  (كام أنجز) + handling avg
+ *  Counts are event-in-window so daily/weekly/monthly are directly comparable. */
+function rangeFunnel_(fromStr, toStr) {
+  const inRange = v => { const d = String(v || '').substr(0, 10); return d && d >= fromStr && d <= toStr; };
+  const byAgent = {}, byLoc = {};
+  const T = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 };
+  ActivityLog.allRows().forEach(r => {
+    const agent = String(r[LG.ACTIVE] || '—') || '—';
+    const loc = String(r[LG.LOC] || '—') || '—';
+    const a = byAgent[agent] || (byAgent[agent] = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 });
+    const l = byLoc[loc] || (byLoc[loc] = { received: 0, delivered: 0, completed: 0 });
+    if (inRange(r[LG.FIRST]))     { a.received++;  l.received++;  T.received++; }
+    if (inRange(r[LG.DELIVERED])) { a.delivered++; l.delivered++; T.delivered++; }
+    if (r[LG.STATE] === ST_DONE && inRange(r[LG.SUPPLIER])) {
+      a.completed++; l.completed++; T.completed++;
+      const mins = Number(r[LG.MINS]) || 0;
+      if (mins > 0) { a.sumMins += mins; a.cnt++; T.sumMins += mins; T.cnt++; }
+    }
+  });
+  Object.keys(byAgent).forEach(k => { const a = byAgent[k]; a.avg = a.cnt ? Math.round(a.sumMins / a.cnt) : 0; });
+  T.avg = T.cnt ? Math.round(T.sumMins / T.cnt) : 0;
+  return { byAgent, byLoc, totals: T };
+}
+
+/** Core report engine: renders the per-agent funnel (وصله/تم التسليم/أنجز +
+ *  متوسط المعالجة + نسبة الإنجاز) and a per-center funnel for a date range. */
 function buildRangeReport_(fromStr, toStr, title, sheetName) {
   const cfg = getConfig_();
   const ss = SpreadsheetApp.getActive();
-  const rows = ActivityLog.allRows();
-
-  const byAgent = {}, byLoc = {};
-  let totalDone = 0;
-  rows.forEach(r => {
-    if (r[LG.STATE] !== ST_DONE) return;
-    const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
-    if (!dp || dp < fromStr || dp > toStr) return;
-    totalDone++;
-    const agent = String(r[LG.ACTIVE] || '—') || '—';
-    const loc = String(r[LG.LOC] || '—') || '—';
-    const mins = Number(r[LG.MINS]) || 0;
-    const a = byAgent[agent] || (byAgent[agent] = { done: 0, sumMins: 0, cnt: 0 });
-    a.done++; if (mins > 0) { a.sumMins += mins; a.cnt++; }
-    const l = byLoc[loc] || (byLoc[loc] = { done: 0 }); l.done++;
-  });
+  const { byAgent, byLoc, totals } = rangeFunnel_(fromStr, toStr);
 
   const sh = getOrCreateSheet_(ss, sheetName);
   sh.clearContents(); sh.clearFormats();
   const nowStr = Utilities.formatDate(new Date(), cfg.tz, 'yyyy-MM-dd HH:mm');
 
-  sh.getRange(1, 1, 1, 5).merge().setValue(`${title} — إجمالي المكتمل: ${totalDone} | ${nowStr}`)
+  // title + KPI summary line
+  sh.getRange(1, 1, 1, 6).merge().setValue(`${title}  (${fromStr} ← ${toStr})`)
     .setBackground(CFG.C_HDR).setFontColor('#fff').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setRowHeight(1, 44);
+  sh.getRange(2, 1, 1, 6).merge().setValue(
+    `وصله ${totals.received} · تم التسليم ${totals.delivered} · أنجز ${totals.completed} · ` +
+    `متوسط المعالجة ${totals.avg ? Util.fmtDuration(totals.avg) : '—'} · حُدّث ${nowStr}`)
+    .setBackground('#162032').setFontColor('#90caf9').setFontSize(10).setHorizontalAlignment('center');
+  sh.setRowHeight(2, 24);
 
-  let R = 3;
-  sh.getRange(R, 1, 1, 4).setValues([['المشرف', 'أنجز (تم التسليم ثم مورد الصرف)', 'متوسط المعالجة', 'إجمالي دقائق']])
+  // per-agent funnel
+  let R = 4;
+  sh.getRange(R, 1, 1, 6).setValues([['المشرف', 'وصله (دخل الطابور)', 'تم التسليم', 'أنجز (مكتمل)', 'متوسط المعالجة', 'نسبة الإنجاز']])
     .setBackground('#1976d2').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
-  const agents = Object.keys(byAgent).sort((a, b) => byAgent[b].done - byAgent[a].done);
+  const agents = Object.keys(byAgent).filter(a => a !== '—')
+    .sort((a, b) => (byAgent[b].received - byAgent[a].received) || (byAgent[b].completed - byAgent[a].completed));
   if (agents.length) {
-    const body = agents.map(name => { const x = byAgent[name]; return [name, x.done, x.cnt ? Util.fmtDuration(Math.round(x.sumMins / x.cnt)) : '—', x.sumMins]; });
-    sh.getRange(R, 1, body.length, 4).setValues(body.map(r => r.map(Util.safeText)))
-      .setBackgrounds(body.map((r, i) => Array(4).fill(i % 2 ? CFG.C_EVEN : CFG.C_ODD)));
+    const body = agents.map(name => {
+      const x = byAgent[name];
+      const rate = x.received ? Math.round(x.completed / x.received * 100) + '%' : '—';
+      return [name, x.received, x.delivered, x.completed, x.avg ? Util.fmtDuration(x.avg) : '—', rate];
+    });
+    body.push(['الإجمالي', totals.received, totals.delivered, totals.completed,
+      totals.avg ? Util.fmtDuration(totals.avg) : '—',
+      totals.received ? Math.round(totals.completed / totals.received * 100) + '%' : '—']);
+    sh.getRange(R, 1, body.length, 6).setValues(body.map(r => r.map(Util.safeText)))
+      .setBackgrounds(body.map((r, i) => Array(6).fill(i === body.length - 1 ? CFG.C_HDR : (i % 2 ? CFG.C_EVEN : CFG.C_ODD))))
+      .setHorizontalAlignment('center');
+    sh.getRange(R + body.length - 1, 1, 1, 6).setFontColor('#fff').setFontWeight('bold');  // totals row
     R += body.length;
-  } else { sh.getRange(R, 1).setValue('لا توجد طلبات مكتملة في هذه الفترة.'); R++; }
+  } else { sh.getRange(R, 1).setValue('لا يوجد نشاط في هذه الفترة.'); R++; }
 
+  // per-center funnel
   R += 2;
-  sh.getRange(R, 1, 1, 2).setValues([['المركز', 'عدد المكتمل']])
+  sh.getRange(R, 1, 1, 4).setValues([['المركز', 'وصله', 'تم التسليم', 'أنجز']])
     .setBackground('#6a1b9a').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
-  Object.keys(byLoc).sort((a, b) => byLoc[b].done - byLoc[a].done).forEach((loc, i) => {
-    sh.getRange(R, 1, 1, 2).setValues([[loc, byLoc[loc].done]]).setBackground(i % 2 ? CFG.C_EVEN : CFG.C_ODD); R++;
-  });
+  const locs = Object.keys(byLoc).filter(l => l !== '—').sort((a, b) => byLoc[b].received - byLoc[a].received);
+  if (locs.length) {
+    const body = locs.map(loc => { const x = byLoc[loc]; return [loc, x.received, x.delivered, x.completed]; });
+    sh.getRange(R, 1, body.length, 4).setValues(body.map(r => r.map(Util.safeText)))
+      .setBackgrounds(body.map((r, i) => Array(4).fill(i % 2 ? CFG.C_EVEN : CFG.C_ODD))).setHorizontalAlignment('center');
+    R += body.length;
+  }
 
-  [230, 260, 150, 130].forEach((w, i) => sh.setColumnWidth(i + 1, w));
-  sh.setFrozenRows(1);
-  alertSafe_(title + ' جاهز.');
+  [230, 175, 130, 130, 155, 120].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  sh.setFrozenRows(2);
+  alertSafe_(`${title} جاهز — وصله ${totals.received} · تم التسليم ${totals.delivered} · أنجز ${totals.completed}.`);
 }
 
 /* ════════════════════════════ ACTIVITY SEARCH ════════════════════════════ */
@@ -1070,6 +1127,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🔎 بحث في سجل النشاط', 'searchActivity')
     .addItem('📆 تقرير حسب التاريخ (من - إلى)', 'buildDateRangeReport')
+    .addItem('📊 تقرير اليوم', 'buildTodayReport')
     .addItem('📊 التقرير الأسبوعي', 'buildWeeklyReport')
     .addItem('📅 التقرير الشهري', 'buildMonthlyReport')
     .addSeparator()

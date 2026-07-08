@@ -1,4 +1,30 @@
-# مسمار — Invoice Audit Monitoring System · v8.2
+# مسمار — Invoice Audit Monitoring System
+
+## v8.3 — analytic reports + Arabic-date fix (latest)
+
+**Date-prompt bug fixed.** The «صيغة التاريخ غير صحيحة» popup happened because the
+prompt received **Arabic-Indic digits** (`٢٠٢٦-٠٧-٠١`) or invisible RTL marks from
+an Arabic keyboard, which the strict `\d` check rejected. `normalizeDate_()` now
+accepts Arabic-Indic **and** Persian digits, RTL/bidi marks, `/` `.` `\`
+separators, single-digit month/day, and even a pasted date-time
+(`2026-07-01 09:12` → `2026-07-01`).
+
+**Reports now do real analysis (a funnel per agent), for any range.** Instead of
+just "completed count", every report (today / week / month / custom range) shows
+per supervisor:
+
+| المشرف | وصله (دخل الطابور) | تم التسليم | أنجز (مكتمل) | متوسط المعالجة | نسبة الإنجاز |
+|---|---|---|---|---|---|
+
+…answering *"how many orders reached the agent, how many were delivered, and how
+many did they complete"* — plus a totals row, average handling time, completion
+rate, and the same funnel per center. Counts are event-in-window (by milestone
+date) so daily/weekly/monthly are directly comparable. New menu item **«📊 تقرير
+اليوم»**; weekly/monthly/custom all use the same engine (`rangeFunnel_`).
+
+---
+
+## v8.2 — one-row log + delivery-based AHT
 
 This version reworks the system around the **real workflow** and the feedback on
 v8.1:
@@ -78,5 +104,5 @@ the pure logic (classification, overnight business-minutes, delivery-based AHT,
 supplier extraction, cost fallback, date-range report aggregation):
 
 ```bash
-cd apps-script && node test_logic.js      # 24 passed, 0 failed
+cd apps-script && node test_logic.js      # 40 passed, 0 failed
 ```

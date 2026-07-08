@@ -26,7 +26,7 @@ vm.createContext(ctx);
 // const/function bindings aren't auto-attached to the vm global — export them explicitly
 const shim = '\n;globalThis.__D = s => new Date(s);' +   // build Dates INSIDE the vm (instanceof)
   '\n;Object.assign(globalThis,{CFG,LG,Util,Api,ActivityLog,LOG_COLS,LOG_HEADERS,ST_QUEUE,ST_DONE,' +
-  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_});';
+  'classifyOrder_,computeMetric_,extractDeliveryInfo_,resolveCostDisplay_,completedByActor_,normalizeDate_,rangeFunnel_});';
 vm.runInContext(src + shim, ctx);
 
 let pass = 0, fail = 0;
@@ -108,6 +108,41 @@ eq('agg excludes out-of-range', Object.keys(agg).sort(), ['Ahmed', 'Sara']);
 eq('LG.SUPPLIER index', LG.SUPPLIER, 9);
 eq('LG.MINS index', LG.MINS, 10);
 eq('LOG_COLS', ctx.LOG_COLS, 13);
+
+// 8) date parsing — the fix for the «صيغة التاريخ غير صحيحة» popup
+eq('date ascii', ctx.normalizeDate_('2026-07-01'), '2026-07-01');
+eq('date arabic-indic digits', ctx.normalizeDate_('٢٠٢٦-٠٧-٠١'), '2026-07-01');
+eq('date persian digits', ctx.normalizeDate_('۲۰۲۶-۰۷-۰۱'), '2026-07-01');
+eq('date with RTL marks', ctx.normalizeDate_('‏2026-07-01‎'), '2026-07-01');
+eq('date slash separators', ctx.normalizeDate_('2026/07/01'), '2026-07-01');
+eq('date single-digit m/d', ctx.normalizeDate_('2026-7-1'), '2026-07-01');
+eq('date pasted with time', ctx.normalizeDate_('2026-07-01 09:12'), '2026-07-01');
+eq('date invalid month', ctx.normalizeDate_('2026-13-01'), '');
+eq('date garbage', ctx.normalizeDate_('hello'), '');
+
+// 9) report funnel: received / delivered / completed per agent within a range
+function mkFull(oid, actor, loc, first, delivered, supplier, mins, state) {
+  const r = new Array(ctx.LOG_COLS).fill('');
+  r[LG.OID] = oid; r[LG.ACTIVE] = actor; r[LG.LOC] = loc;
+  r[LG.FIRST] = first; r[LG.DELIVERED] = delivered; r[LG.SUPPLIER] = supplier; r[LG.MINS] = mins; r[LG.STATE] = state;
+  return r;
+}
+ctx.ActivityLog.allRows = () => [
+  //      oid  agent    center  first(recv)        delivered          supplier(done)     mins  state
+  mkFull('1', 'Ahmed', 'C1', '2026-07-01 08:00', '2026-07-01 09:00', '2026-07-01 09:40', 40, 'مكتمل'),
+  mkFull('2', 'Ahmed', 'C1', '2026-07-01 10:00', '2026-07-01 11:00', '',                  '', 'قيد الطابور'), // recv+deliv, not done
+  mkFull('3', 'Ahmed', 'C2', '2026-06-20 10:00', '2026-07-01 12:00', '2026-07-01 13:00', 60, 'مكتمل'),        // recv out of range, deliv+done in
+  mkFull('4', 'Sara',  'C2', '2026-07-01 09:00', '',                  '',                  '', 'قيد الطابور'), // received only
+  mkFull('5', 'Ahmed', 'C1', '2026-07-05 09:00', '2026-07-05 10:00', '2026-07-05 10:30', 30, 'مكتمل'),        // out of the 07-01 window
+];
+const fn = ctx.rangeFunnel_('2026-07-01', '2026-07-01');
+eq('funnel Ahmed received', fn.byAgent.Ahmed.received, 2);   // orders 1,2 (3 arrived 06-20, 5 on 07-05)
+eq('funnel Ahmed delivered', fn.byAgent.Ahmed.delivered, 3); // orders 1,2,3 delivered on 07-01
+eq('funnel Ahmed completed', fn.byAgent.Ahmed.completed, 2); // orders 1,3 done on 07-01
+eq('funnel Ahmed avg', fn.byAgent.Ahmed.avg, 50);            // (40+60)/2
+eq('funnel Sara received', fn.byAgent.Sara.received, 1);
+eq('funnel totals', [fn.totals.received, fn.totals.delivered, fn.totals.completed], [3, 3, 2]);
+eq('funnel center C1 received', fn.byLoc.C1.received, 2);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
