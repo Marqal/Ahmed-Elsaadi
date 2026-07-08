@@ -241,6 +241,31 @@ const Util = {
 
   nowIso() { return new Date().toISOString(); },
 
+  /** ── FIX v8.3: any date-ish value → "yyyy-MM-dd" prefix. Handles a real Date
+   *  object, an ISO string, the JS Date.toString() form ("Sat Jul 04 2026 …") that
+   *  Sheets stored when it coerced our strings, and our clean "yyyy-MM-dd HH:mm".
+   *  This is what makes the range/daily filters actually match. */
+  datePrefix(v, tz) {
+    if (v === null || v === undefined || v === '') return '';
+    if (v instanceof Date) return isNaN(v) ? '' : Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+    const s = String(v).trim();
+    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);      // already ISO-ish
+    if (m) return m[1] + '-' + m[2] + '-' + m[3];
+    const d = new Date(s);                               // parse toString / other
+    return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  },
+
+  /** ── FIX v8.3: any date-ish value → clean "yyyy-MM-dd HH:mm" (self-heals the log
+   *  so it is consistent and searchable). Non-date strings pass through unchanged. */
+  toDisplay(v, tz) {
+    if (v === null || v === undefined || v === '') return '';
+    if (v instanceof Date) return isNaN(v) ? '' : Utilities.formatDate(v, tz, 'yyyy-MM-dd HH:mm');
+    const s = String(v).trim();
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) return s;   // already clean
+    const d = new Date(s);
+    return isNaN(d) ? s : Utilities.formatDate(d, tz, 'yyyy-MM-dd HH:mm');
+  },
+
   safeText(v) {
     if (v === null || v === undefined) return '';
     const s = String(v);
@@ -443,8 +468,8 @@ function extractDeliveryInfo_(detail, cfg) {
 
 function resolveCostDisplay_(invIso, prevRow, cfg) {
   if (invIso) return Util.fmtDt(invIso, cfg.tz);                 // system input time
-  if (prevRow && prevRow[LG.COST]) return String(prevRow[LG.COST]);
-  if (prevRow && prevRow[LG.FIRST]) return String(prevRow[LG.FIRST]);  // sheet first-seen fallback
+  if (prevRow && prevRow[LG.COST]) return Util.toDisplay(prevRow[LG.COST], cfg.tz);
+  if (prevRow && prevRow[LG.FIRST]) return Util.toDisplay(prevRow[LG.FIRST], cfg.tz);  // sheet first-seen fallback
   return Util.fmtDt(new Date(), cfg.tz);
 }
 
@@ -513,20 +538,32 @@ const ActivityLog = {
         if (action.indexOf('تسوية') > -1) { o.supplier = time; o.state = ST_DONE; if (mins !== '' && mins != null) o.mins = mins; }
       });
     }
-    // park old sheet, create fresh new-schema sheet, write collapsed rows
-    try { if (!ss.getSheetByName(CFG.SH_LOG_OLD)) oldSheet.setName(CFG.SH_LOG_OLD); else oldSheet.setName(CFG.SH_LOG_OLD + ' ' + Utilities.formatDate(new Date(), CFG.DEF_TZ, 'MMdd-HHmm')); }
-    catch (e) {}
+    // park old sheet (hidden, as a safety backup) + create fresh new-schema sheet
+    try {
+      if (!ss.getSheetByName(CFG.SH_LOG_OLD)) oldSheet.setName(CFG.SH_LOG_OLD);
+      else oldSheet.setName(CFG.SH_LOG_OLD + ' ' + Utilities.formatDate(new Date(), CFG.DEF_TZ, 'MMdd-HHmm'));
+      oldSheet.hideSheet();   // declutter — it's just a pre-migration backup
+    } catch (e) {}
     const sh = ss.insertSheet(CFG.SH_LOG);
     this.writeHeader_(sh);
+    const tz = getConfig_().tz;
     const rows = Object.keys(byOrder).map(oid => {
       const o = byOrder[oid];
       const out = new Array(LOG_COLS).fill('');
       out[LG.OID] = oid; out[LG.IID] = o.iid; out[LG.LOC] = o.loc; out[LG.ACTIVE] = o.actor; out[LG.STATUS] = o.status;
-      out[LG.FIRST] = o.first; out[LG.READY] = o.ready; out[LG.DELIVERED] = o.delivered; out[LG.SUPPLIER] = o.supplier;
-      out[LG.MINS] = o.mins; out[LG.STATE] = o.state; out[LG.UPDATED] = o.supplier || o.delivered || o.first;
+      // normalise old timestamps (which may be Date objects / JS toString) to clean text
+      out[LG.FIRST] = Util.toDisplay(o.first, tz); out[LG.READY] = Util.toDisplay(o.ready, tz);
+      out[LG.DELIVERED] = Util.toDisplay(o.delivered, tz); out[LG.SUPPLIER] = Util.toDisplay(o.supplier, tz);
+      out[LG.MINS] = o.mins; out[LG.STATE] = o.state;
+      out[LG.UPDATED] = out[LG.SUPPLIER] || out[LG.DELIVERED] || out[LG.FIRST];
       return out;
     });
-    if (rows.length) sh.getRange(2, 1, rows.length, LOG_COLS).setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+    if (rows.length) {
+      const rng = sh.getRange(2, 1, rows.length, LOG_COLS);
+      rng.setNumberFormat('@');   // text FIRST so dates are not coerced to Date values
+      sh.getRange(2, LG.MINS + 1, rows.length, 1).setNumberFormat('0');
+      rng.setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+    }
     console.log(`log migrated → ${rows.length} order rows`);
   },
 
@@ -544,7 +581,7 @@ const ActivityLog = {
 
   /** Upsert current queue records, detect settlements (supplier added), archive
    *  old completed rows, and write the whole thing back in one setValues. */
-  update(log, records, cfg) {
+  update(log, records, cfg, matrix) {
     const now = Util.fmtDt(new Date(), cfg.tz);
     const currentIds = new Set();
 
@@ -597,23 +634,34 @@ const ActivityLog = {
     const keep = [], arch = [];
     log.rows.forEach(r => {
       const done = r[LG.STATE] === ST_DONE;
-      const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
+      const dp = Util.datePrefix(r[LG.SUPPLIER], cfg.tz);
       if (done && dp && dp < cutoff) arch.push(r); else keep.push(r);
     });
+
+    // ── FIX v8.3: SELF-HEAL every row before writing —
+    //   • normalise all date cells to clean "yyyy-MM-dd HH:mm" (repairs the JS
+    //     toString dates that broke report filtering / searchability);
+    //   • fill/repair «المسؤول» from the Matrix by center when missing or numeric.
+    const DATE_COLS = [LG.COST, LG.FIRST, LG.READY, LG.DELIVERED, LG.SUPPLIER, LG.UPDATED];
+    [keep, arch].forEach(list => list.forEach(r => {
+      DATE_COLS.forEach(c => { r[c] = Util.toDisplay(r[c], cfg.tz); });
+      r[LG.ACTIVE] = logAgent_(r, matrix || {});
+    }));
     if (arch.length) this.archive_(arch);
 
-    // (d) write back (clear then one setValues; handles shrink from archiving)
+    // (d) write back. Text format is applied BEFORE setValues so Sheets keeps our
+    //     date strings as text (the previous order let Sheets coerce them to Date
+    //     values → JS toString on next read → the all-zero reports).
     const sh = log.sheet;
     const prevRows = Math.max(sh.getLastRow() - 1, 0);
     if (prevRows) { const rg = sh.getRange(2, 1, prevRows, LOG_COLS); rg.clearContent(); rg.setBackground(null); }
     if (keep.length) {
-      sh.getRange(2, 1, keep.length, LOG_COLS)
-        .setValues(keep.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
-      sh.getRange(2, 1, keep.length, LOG_COLS).setNumberFormat('@');
+      const rng = sh.getRange(2, 1, keep.length, LOG_COLS);
+      rng.setNumberFormat('@');
       sh.getRange(2, LG.MINS + 1, keep.length, 1).setNumberFormat('0');
-      // subtle status coloring
+      rng.setValues(keep.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
       const bg = keep.map(r => Array(LOG_COLS).fill(r[LG.STATE] === ST_DONE ? CFG.C_GRN : CFG.C_EVEN));
-      sh.getRange(2, 1, keep.length, LOG_COLS).setBackgrounds(bg);
+      rng.setBackgrounds(bg);
     }
     console.log(`log: ${keep.length} rows (settled this run: ${lookups}, archived: ${arch.length})`);
   },
@@ -628,8 +676,9 @@ const ActivityLog = {
       arc = null;
     }
     if (!arc) { arc = ss.insertSheet(CFG.SH_LOG_ARC); arc.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]); arc.setFrozenRows(1); }
-    arc.getRange(arc.getLastRow() + 1, 1, rows.length, LOG_COLS)
-       .setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
+    const rng = arc.getRange(arc.getLastRow() + 1, 1, rows.length, LOG_COLS);
+    rng.setNumberFormat('@');   // keep dates as text
+    rng.setValues(rows.map(rr => rr.map((v, ci) => ci === LG.MINS ? v : Util.safeText(v))));
   },
 
   /** All log rows (live + archive) as arrays — used by reports/daily.
@@ -669,9 +718,10 @@ function logAgent_(row, matrix) {
 function completedByActor_(fromStr, toStr) {
   const out = {};
   const matrix = readMatrix_();
+  const tz = getConfig_().tz;
   ActivityLog.allRows().forEach(r => {
     if (r[LG.STATE] !== ST_DONE) return;
-    const dp = String(r[LG.SUPPLIER] || '').substr(0, 10);
+    const dp = Util.datePrefix(r[LG.SUPPLIER], tz);   // ── FIX v8.3: robust date parse
     if (!dp || dp < fromStr || dp > toStr) return;
     const actor = logAgent_(r, matrix);
     const mins = Number(r[LG.MINS]) || 0;
@@ -739,7 +789,7 @@ function runMismar() {
     });
 
     // 4) upsert the one-row-per-order log + detect settlements (supplier added)
-    ActivityLog.update(log, records, cfg);
+    ActivityLog.update(log, records, cfg, matrix);
 
     // 5) render (batched)
     renderMain_(ss, records, cfg);
@@ -1017,7 +1067,8 @@ function buildDateRangeReport() {
  *    completed = وقت إضافة مورد الصرف within range  (كام أنجز) + handling avg
  *  Counts are event-in-window so daily/weekly/monthly are directly comparable. */
 function rangeFunnel_(fromStr, toStr) {
-  const inRange = v => { const d = String(v || '').substr(0, 10); return d && d >= fromStr && d <= toStr; };
+  const tz = getConfig_().tz;
+  const inRange = v => { const d = Util.datePrefix(v, tz); return d && d >= fromStr && d <= toStr; };
   const matrix = readMatrix_();
   const byAgent = {}, byLoc = {};
   const T = { received: 0, delivered: 0, completed: 0, sumMins: 0, cnt: 0 };
@@ -1115,21 +1166,27 @@ function searchActivity() {
 
   const dateRes = ui.prompt('بحث النشاط', 'التاريخ YYYY-MM-DD (يطابق أي مرحلة، فارغ=الكل):', ui.ButtonSet.OK_CANCEL);
   if (dateRes.getSelectedButton() !== ui.Button.OK) return;
-  const date = dateRes.getResponseText().trim();
+  const date = normalizeDate_(dateRes.getResponseText());   // accept Arabic digits too
 
+  const tz = getConfig_().tz;
   const data = ActivityLog.allRows();
   const dateCols = [LG.COST, LG.FIRST, LG.READY, LG.DELIVERED, LG.SUPPLIER];
   const hits = data.filter(r => {
     if (oid && String(r[LG.OID] || '') !== oid) return false;
     if (agent && String(r[LG.ACTIVE] || '').indexOf(agent) === -1) return false;
-    if (date && !dateCols.some(c => String(r[c] || '').substr(0, 10) === date)) return false;
+    if (date && !dateCols.some(c => Util.datePrefix(r[c], tz) === date)) return false;
     return true;
   });
 
   const out = getOrCreateSheet_(SpreadsheetApp.getActive(), CFG.SH_SEARCH);
   out.clearContents(); out.clearFormats();
   out.getRange(1, 1, 1, LOG_COLS).setValues([LOG_HEADERS]).setBackground('#1a237e').setFontColor('#fff').setFontWeight('bold');
-  if (hits.length) out.getRange(2, 1, hits.length, LOG_COLS).setValues(hits.map(r => r.map(Util.safeText)));
+  if (hits.length) {
+    const dateCols2 = [LG.COST, LG.FIRST, LG.READY, LG.DELIVERED, LG.SUPPLIER, LG.UPDATED];
+    const rng = out.getRange(2, 1, hits.length, LOG_COLS);
+    rng.setNumberFormat('@');
+    rng.setValues(hits.map(r => r.map((v, c) => dateCols2.indexOf(c) > -1 ? Util.toDisplay(v, tz) : Util.safeText(v))));
+  }
   out.setFrozenRows(1);
   SpreadsheetApp.setActiveSheet(out);
   ui.alert(`عدد النتائج: ${hits.length}`);

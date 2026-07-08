@@ -2,6 +2,26 @@
 
 ## v8.3 — analytic reports + Arabic-date fix (latest)
 
+**Report showed all-zeros + messy log — fixed.** Google Sheets had coerced the
+log's date strings into real Date values (text format was applied *after*
+writing), so on the next read they came back as JS `Date.toString()`
+("Sat Jul 04 2026 15:37:00 GMT+0300 …"). The report's date filter did
+`substr(0,10)` → `"Sat Jul 04"` ≠ `yyyy-MM-dd`, so nothing matched and every
+metric was 0. Now:
+- `Util.datePrefix()` / `Util.toDisplay()` parse **any** form (Date object, ISO,
+  JS toString, clean string) → reports filter correctly and the log **self-heals**
+  to a clean `yyyy-MM-dd HH:mm` on the next run.
+- Text format is applied **before** writing, so Sheets never re-coerces dates.
+- «المسؤول» in the log is now filled from the **Matrix** by center whenever it is
+  missing/numeric, so the log is consistent and searchable (search also accepts
+  Arabic-Indic digits).
+- The pre-migration backup tab is hidden to reduce clutter.
+
+**After updating, run «▶ تشغيل التحديث الآن» once** to clean the stored dates and
+fill agent names, then the reports.
+
+---
+
 **Supervisor column showed order/invoice numbers — fixed.** The report reader
 (`ActivityLog.allRows`) read the log sheet *directly*, bypassing the schema
 migration. If you opened a report before `runMismar` had migrated the log, it read
@@ -116,5 +136,5 @@ the pure logic (classification, overnight business-minutes, delivery-based AHT,
 supplier extraction, cost fallback, date-range report aggregation):
 
 ```bash
-cd apps-script && node test_logic.js      # 45 passed, 0 failed
+cd apps-script && node test_logic.js      # 52 passed, 0 failed
 ```

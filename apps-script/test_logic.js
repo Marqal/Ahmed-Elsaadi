@@ -18,11 +18,13 @@ const Utilities = {
   }
 };
 const noop = () => {};
+const noSheet = { getSheetByName: () => null };
 const ctx = {
   console, Utilities,
-  // getActive() returns a stub whose getSheetByName yields null, so readMatrix_() → {}
-  SpreadsheetApp: { getActive: () => ({ getSheetByName: () => null }) },
-  UrlFetchApp: {}, PropertiesService: {}, LockService: {}, ScriptApp: {}, Session: {},
+  // getActive()/getActiveSpreadsheet() yield no sheets, so readMatrix_()→{} and getConfig_()→defaults
+  SpreadsheetApp: { getActive: () => noSheet, getActiveSpreadsheet: () => noSheet },
+  PropertiesService: { getScriptProperties: () => ({ getProperty: () => '' }) },
+  UrlFetchApp: {}, LockService: {}, ScriptApp: {}, Session: {},
 };
 vm.createContext(ctx);
 // const/function bindings aren't auto-attached to the vm global — export them explicitly
@@ -145,6 +147,22 @@ eq('funnel Ahmed avg', fn.byAgent.Ahmed.avg, 50);            // (40+60)/2
 eq('funnel Sara received', fn.byAgent.Sara.received, 1);
 eq('funnel totals', [fn.totals.received, fn.totals.delivered, fn.totals.completed], [3, 3, 2]);
 eq('funnel center C1 received', fn.byLoc.C1.received, 2);
+
+// 9b) date parsing must survive the JS toString format Sheets stored (all-zero bug)
+const TS = 'Sat Jul 04 2026 15:37:00 GMT+0300 (Eastern European Summer Time)';
+eq('datePrefix toString', ctx.Util.datePrefix(TS, 'Asia/Riyadh'), '2026-07-04');
+eq('datePrefix clean', ctx.Util.datePrefix('2026-07-04 15:37', 'Asia/Riyadh'), '2026-07-04');
+eq('datePrefix Date obj', ctx.Util.datePrefix(ctx.__D('2026-07-04T12:37:00Z'), 'Asia/Riyadh'), '2026-07-04');
+eq('datePrefix empty', ctx.Util.datePrefix('', 'Asia/Riyadh'), '');
+eq('toDisplay toString→clean', ctx.Util.toDisplay(TS, 'Asia/Riyadh'), '2026-07-04 15:37');
+eq('toDisplay already clean', ctx.Util.toDisplay('2026-07-04 15:37', 'Asia/Riyadh'), '2026-07-04 15:37');
+
+// a funnel whose log rows carry toString dates must still count (this is the bug)
+ctx.ActivityLog.allRows = () => [
+  mkFull('1', 'Ehab Ibrahim', 'C1', TS, TS, TS, 394, 'مكتمل'),  // all milestones on 2026-07-04
+];
+const fnTS = ctx.rangeFunnel_('2026-07-01', '2026-07-31');
+eq('funnel counts toString dates', [fnTS.totals.received, fnTS.totals.delivered, fnTS.totals.completed], [1, 1, 1]);
 
 // 10) supervisor resolver — the fix for «المشرف» showing order/invoice numbers
 const mtx = { 'C1': { p1: 'Ahmed', p2: 'Sara' }, 'C2': { p1: 'Omar', p2: '' } };
