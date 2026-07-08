@@ -1,42 +1,36 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  مسمار — تقرير صرف الفواتير (Disbursement / Cost-Invoice Report)  v1.1       ║
+ * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.2            ║
  * ║  STANDALONE script — separate from the audit-monitoring script.            ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * WHAT IT DOES (يعمل زي فلترة صفحة «التكاليف» في الأدمن ثم يضيف رقم اللوحة):
- *   • يجلب فواتير التكلفة B2B من نفس واجهة الأدمن:
- *       GET /adminApi/v2/orders-cost-invoices
- *   • وضعان (Mode):
- *       - «paid»   : الفواتير المصروفة (تم الدفع / الدفع بالأجل) ضمن «تاريخ الصرف من–إلى».
- *       - «unpaid» : الفواتير غير المصروفة (بدون تاريخ صرف) — لا نحدد لها تاريخًا.
- *   • فلترة «مكان الصرف» بالاسم (أو بالـID)، ونوع الطلب ثابت B2B_business.
- *   • المشكلة التي يحلّها: «رقم اللوحة» غير موجود في صفحة التكاليف، فيدخل كل طلب
- *       GET /adminApi/v1/orders/{orderId}
- *     ويستخرج رقم اللوحة (أرقام + حروف)، ويتحقق أن «تاريخ الصرف» مطابق للنطاق.
- *   • يكتب النتيجة في تبويب «تقرير الصرف».
+ * الهدف: يسحب فواتير التكلفة B2B بالجملة (مثلاً كل المسددة لسنة 2026، أو غير المسددة)
+ * إلى تبويب واحد «بيانات الصرف» تفلتره في Looker Studio — **مع إضافة رقم اللوحة**
+ * الذي لا يظهر في صفحة التكاليف (يُجلب من داخل كل طلب).
  *
- * ══════════════ معاملات الـAPI (مؤكّدة من طلب الشبكة الفعلي) ══════════════
- *   ?businessOrderTypes=B2B_business
- *    &fromPaidDate=YYYY-MM-DD &toPaidDate=YYYY-MM-DD   ← تاريخ الصرف من/إلى
- *    &status=1                                          ← حالة الدفع (1=تم الدفع)
- *    &purchaseLocationsIds=862                          ← مكان الصرف (بالـID)
- *    &offset=0 &limit=100 &page=1
- *   الرد: { data: { raw: [...], total: N } }
- *   • status: 1 = تم الدفع (مؤكّد) · 2 = غير مدفوعة (من السكربت الأول) · 3 = بالأجل (يُرجى التأكد).
- *   • «مكان الصرف» في الأدمن بالـID؛ هنا نقبل الاسم (فلترة داخلية) أو الـID (أدق، server-side).
- *   • بديل: الصق كامل كويري البحث في خانة RAW_QUERY لضمان مطابقة الأدمن 100%.
- *   • أسماء حقول عناصر الـraw (المبلغ/المورد/النوع/تاريخ الصرف) تُقرأ بمرشّحات مرنة —
- *     لو ظهر عمود فارغ أرسل لي عنصر raw واحدًا وأثبّته.
+ * ضمان صحّة البيانات:
+ *   • كل **فاتورة تكلفة = صف واحد** (المفتاح = رقم الفاتورة، upsert).
+ *   • **لا يوجد حذف تكرارات للسيارات**: لو سيارة اتعملها صيانة مرتين → فاتورتان →
+ *     صفّان. لا نجمعهم أبدًا. التكرار الوحيد الممنوع هو تكرار **نفس الفاتورة**.
  *
- * التوكن: يُحفظ بأمان في Script Properties (زر «حفظ التوكن»)، نفس توكن مسمار.
- * RUNTIME: V8.
+ * السحب السنوي كبير، والحدّ 6 دقائق للتشغيل، لذلك:
+ *   • جلب رقم اللوحة مُخزَّن في كاش دائم (orderId → لوحة) فلا يُعاد جلبه أبدًا.
+ *   • التشغيل **قابل للاستئناف**: كل تشغيلة تكمل ما تبقّى؛ شغّل «إكمال جلب اللوحات»
+ *     أو فعّل التشغيل التلقائي حتى تكتمل كل اللوحات.
+ *
+ * معاملات الـAPI مؤكّدة من طلب الأدمن الفعلي:
+ *   ?businessOrderTypes=B2B_business&fromPaidDate=..&toPaidDate=..&status=1
+ *    &purchaseLocationsIds=..&spendSupplierIds=..&offset=..&limit=..&page=..
+ *   الرد: { data: { raw: [...], total: N } }.  status: 1=تم الدفع، 2=غير مدفوعة، 3=بالأجل(تأكيد).
+ *
+ * التوكن يُحفظ بأمان في Script Properties. RUNTIME: V8.
  */
 
 /* ════════════════════════════ CONFIG ════════════════════════════ */
 const CFG = {
-  SH_SET:    'الاعدادات',
-  SH_REPORT: 'تقرير الصرف',
+  SH_SET:   'الاعدادات',
+  SH_DATA:  'بيانات الصرف',        // ← مصدر Looker (صف لكل فاتورة، upsert)
+  SH_CACHE: '__plate_cache',       // hidden: orderId → plate
 
   API_BASE: 'https://api.mismarapp.com',
   ORIGIN:   'https://admin.mismarapp.com',
@@ -44,9 +38,9 @@ const CFG = {
   ORDER_ENDPOINT: '/adminApi/v1/orders/',
 
   INV_LIMIT: 100,
-  MAX_PAGES: 100,
+  MAX_PAGES: 300,                  // up to 30k invoices per status per run
   FETCH_CHUNK: 25,
-  SOFT_TIME_LIMIT_MS: 4.5 * 60 * 1000,
+  SOFT_TIME_LIMIT_MS: 4.7 * 60 * 1000,
   DEF_TZ: 'Asia/Riyadh',
 
   // Settings cells
@@ -57,7 +51,6 @@ const CFG = {
   // ── CONFIRMED query params (from the live admin request)
   P_DATE_FROM: 'fromPaidDate', P_DATE_TO: 'toPaidDate', P_STATUS: 'status', P_LOC_IDS: 'purchaseLocationsIds',
   P_SUP_IDS: 'spendSupplierIds',   // ← مورد الصرف بالـID (نمط مثل purchaseLocationsIds — يُرجى التأكد)
-  // payment status ids: 1=تم الدفع (confirmed) · 2=غير مدفوعة · 3=بالأجل (verify)
   STATUS_LABELS: { '1': 'تم الدفع', '2': 'غير مدفوعة', '3': 'الدفع بالأجل' },
   STATUS_PAID_DEFAULT: '1,3', STATUS_UNPAID_DEFAULT: '2',
 
@@ -68,18 +61,27 @@ const CFG = {
   F_TYPE:      ['spendType.name', 'costType.name', 'type.name', 'spendTypeName', 'costInvoiceType.name'],
   F_SUPPLIER:  ['supplier.name', 'spendSupplier.name', 'disbursementSupplier.name', 'costSupplier.name', 'supplierName'],
   F_LOCATION:  ['purchaseLocation.name', 'spendLocation.name', 'location.name', 'purchaseLocationName'],
-  F_SPEND_AT:  ['paidDate', 'paidAt', 'spendDate', 'spendAt', 'disbursementDate', 'paymentDate'],   // ← paidDate (matches fromPaidDate/toPaidDate)
+  F_SPEND_AT:  ['paidDate', 'paidAt', 'spendDate', 'spendAt', 'disbursementDate', 'paymentDate'],
   F_DUE_AT:    ['dueDate', 'dueAt', 'entitlementDate'],
   F_INV_AT:    ['invoiceDate', 'invoiceCreatedAt', 'createdAt'],
 
-  // ── VERIFY: order-detail plate field candidates (number + letters, or full text).
+  // ── VERIFY: order-detail plate field candidates.
   CAR_CONTAINERS: ['usersCar', 'car', 'vehicle', 'userCar', 'orderCar', 'carInfo'],
   F_PLATE_NUM:   ['plateNumber', 'plateNumbers', 'plateNo', 'plateEnglishNumbers', 'plateArabicNumbers', 'plateDigits', 'number'],
   F_PLATE_CHARS: ['plateCharacters', 'plateChars', 'plateArabicCharacters', 'plateEnglishCharacters', 'plateLetters', 'characters', 'letters'],
   F_PLATE_FULL:  ['licensePlate', 'fullPlate', 'plateText', 'plate'],
 
-  C_HDR:'#0d1b2a', C_ODD:'#f8f9fa', C_EVEN:'#ffffff', C_GRN:'#e6f4ea', C_ORG:'#fff3e0', C_GRY:'#f5f5f5'
+  C_HDR:'#0d1b2a', C_ODD:'#f8f9fa', C_EVEN:'#ffffff', C_GRN:'#e6f4ea', C_ORG:'#fff3e0'
 };
+
+// ── Data sheet columns (Looker-friendly). Amount numeric; dates as ISO text.
+const DI = { IID:0, OID:1, PLATE:2, LOC:3, SUP:4, TYPE:5, AMOUNT:6, SPEND:7, YEAR:8, MONTH:9, DUE:10, INV:11, PAY:12, MODE:13, MATCH:14, UPDATED:15 };
+const DATA_COLS = 16;
+const DATA_HEADERS = [
+  'رقم الفاتورة', 'رقم الطلب', 'رقم اللوحة', 'مكان الصرف', 'مورد الصرف', 'نوع الصرف',
+  'المبلغ', 'تاريخ الصرف', 'السنة', 'الشهر', 'تاريخ الاستحقاق', 'تاريخ الفاتورة',
+  'حالة الدفع', 'الوضع', 'مطابقة التاريخ', 'آخر تحديث'
+];
 
 class AuthError extends Error { constructor(code){ super('AUTH_'+code); this.name='AuthError'; this.code=code; } }
 
@@ -168,8 +170,6 @@ const Api = {
       'Accept-Language': 'ar', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
   },
 
-  /** Build one page's query. status may be a single id (server-side) or null.
-   *  RAW_QUERY (pasted from the admin) wins and only pagination is appended. */
   buildQuery(cfg, status, page) {
     const limit = CFG.INV_LIMIT, offset = (page - 1) * limit;
     if (cfg.rawQuery) {
@@ -185,7 +185,6 @@ const Api = {
     return q;
   },
 
-  /** Fetch every page for every requested status, following data.total. */
   fetchAllInvoices(cfg) {
     const rows = [];
     const statusList = cfg.rawQuery ? [null] : (cfg.statuses.length ? cfg.statuses : [null]);
@@ -226,7 +225,6 @@ const Api = {
   }
 };
 
-/** Parse one cost-invoice list item into a flat record. */
 function parseInvoice_(i, queriedStatus) {
   const st = (i.status !== undefined && i.status !== null && i.status !== '') ? String(i.status)
            : (queriedStatus != null ? String(queriedStatus) : '');
@@ -241,26 +239,18 @@ function parseInvoice_(i, queriedStatus) {
     dueAt:     pick_(i, CFG.F_DUE_AT),
     invAt:     pick_(i, CFG.F_INV_AT),
     status:    st,
-    // paid = status not "2" (unpaid); fall back to paymentMethodId when status absent
     paid:      st ? (st !== '2') : !(i.paymentMethodId === null || i.paymentMethodId === '' || i.paymentMethodId === undefined),
     _raw: i
   };
 }
 
-/* ════════════════════════════ PLATE EXTRACTION ════════════════════════════
- * Plate is NOT on the cost page — only inside the order detail. The order page
- * renders it as a number ("3039") + Arabic letters ("ا س ط"). We parse
- * /adminApi/v1/orders/{id} and assemble "<number> <letters>". */
+/* ════════════════════════════ PLATE EXTRACTION ════════════════════════════ */
 function extractPlate_(text) {
   let d; try { d = JSON.parse(text); } catch(e){ return ''; }
   const od = d.orderDetails || d.data || d || {};
-  for (const key of CFG.CAR_CONTAINERS) {
-    const car = od[key];
-    if (car && typeof car === 'object') { const p = plateFromCar_(car); if (p) return p; }
-  }
+  for (const key of CFG.CAR_CONTAINERS) { const car = od[key]; if (car && typeof car === 'object') { const p = plateFromCar_(car); if (p) return p; } }
   return deepFindPlate_(od, 0);
 }
-
 function plateFromCar_(car) {
   const full = pick_(car, CFG.F_PLATE_FULL);
   if (full && /[0-9٠-٩ء-ي]/.test(String(full))) return String(full).trim();
@@ -268,7 +258,6 @@ function plateFromCar_(car) {
   const chr = String(pick_(car, CFG.F_PLATE_CHARS) || '').trim();
   return [num, chr].filter(Boolean).join(' ').trim();
 }
-
 function deepFindPlate_(obj, depth) {
   if (!obj || typeof obj !== 'object' || depth > 6) return '';
   const keys = Object.keys(obj);
@@ -277,8 +266,74 @@ function deepFindPlate_(obj, depth) {
   return '';
 }
 
-/* ════════════════════════════ MAIN ════════════════════════════ */
-function runDisbursementReport() {
+/* ════════════════════════════ PLATE CACHE (persistent, resumable) ════════════════════════════ */
+const PlateCache = {
+  _map: null,
+  sheet_() {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName(CFG.SH_CACHE);
+    if (!sh) { sh = ss.insertSheet(CFG.SH_CACHE); sh.getRange(1, 1, 1, 2).setValues([['orderId', 'plate']]); sh.hideSheet(); }
+    return sh;
+  },
+  load() {
+    const sh = this.sheet_(); this._map = {};
+    if (sh.getLastRow() >= 2) sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues().forEach(r => { const id = String(r[0] || ''); if (id) this._map[id] = String(r[1] || ''); });
+    return this;
+  },
+  has(id) { return Object.prototype.hasOwnProperty.call(this._map, String(id)); },   // fetched before (even if empty)
+  get(id) { return this._map[String(id)]; },
+  set(id, plate) { this._map[String(id)] = (plate == null ? '' : String(plate)); },
+  save() {
+    const sh = this.sheet_();
+    const ids = Object.keys(this._map);
+    const prev = Math.max(sh.getLastRow() - 1, 0);
+    if (prev) sh.getRange(2, 1, prev, 2).clearContent();
+    if (ids.length) {
+      const rng = sh.getRange(2, 1, ids.length, 2); rng.setNumberFormat('@');
+      rng.setValues(ids.map(id => [Util.safeText(id), Util.safeText(this._map[id])]));
+    }
+  }
+};
+
+/* ════════════════════════════ DATA TABLE (upsert by invoiceId) ════════════════════════════ */
+const DataTable = {
+  sheet_() {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName(CFG.SH_DATA);
+    if (!sh) sh = ss.insertSheet(CFG.SH_DATA);
+    if (String(sh.getRange(1, 1).getValue()) !== DATA_HEADERS[0]) {
+      sh.getRange(1, 1, 1, DATA_COLS).setValues([DATA_HEADERS]).setBackground('#0d1b2a').setFontColor('#fff').setFontWeight('bold');
+      sh.setFrozenRows(1);
+      [110, 100, 140, 220, 190, 150, 100, 110, 70, 90, 110, 110, 120, 90, 160, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+    }
+    return sh;
+  },
+  read() {
+    const sh = this.sheet_();
+    const rows = sh.getLastRow() >= 2 ? sh.getRange(2, 1, sh.getLastRow() - 1, DATA_COLS).getValues() : [];
+    const idx = {}; rows.forEach((r, i) => { const id = String(r[DI.IID] || ''); if (id) idx[id] = i; });
+    return { sheet: sh, rows, idx };
+  },
+  write(rows) {
+    const sh = this.sheet_();
+    const prev = Math.max(sh.getLastRow() - 1, 0);
+    if (prev) { const rg = sh.getRange(2, 1, prev, DATA_COLS); rg.clearContent(); rg.setBackground(null); }
+    if (!rows.length) return;
+    const rng = sh.getRange(2, 1, rows.length, DATA_COLS);
+    rng.setNumberFormat('@');                                   // text first (dates stay ISO text)
+    sh.getRange(2, DI.AMOUNT + 1, rows.length, 1).setNumberFormat('0.00');   // amount numeric for Looker
+    rng.setValues(rows.map(r => r.map((v, ci) => ci === DI.AMOUNT ? (v === '' || v == null ? '' : Number(v)) : Util.safeText(v))));
+    const bg = rows.map(r => Array(DATA_COLS).fill(
+      !String(r[DI.PLATE] || '').trim() ? CFG.C_ORG : (String(r[DI.MATCH]).indexOf('⚠️') > -1 ? CFG.C_ORG : CFG.C_EVEN)));
+    rng.setBackgrounds(bg);
+  }
+};
+
+/* ════════════════════════════ MAIN: sync + enrich (resumable) ════════════════════════════ */
+/** Full sync: fetch invoices for the configured scope, upsert into «بيانات الصرف»
+ *  (one row per invoice — never dedupe cars), then enrich plates until the soft
+ *  deadline. Safe to run repeatedly; plates complete over successive runs. */
+function syncDisbursementData() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) { notify_('هناك تشغيل جارٍ — تم التخطّي.'); return; }
   const t0 = Date.now();
@@ -286,13 +341,14 @@ function runDisbursementReport() {
     const cfg = getConfig_();
     if (!cfg.token || cfg.token.length < 30) { notify_('التوكن غير موجود. من القائمة: حفظ التوكن.'); return; }
     if (cfg.mode === 'paid' && !cfg.rawQuery && (!cfg.dateFrom || !cfg.dateTo)) {
-      alertSafe_('وضع «paid» يحتاج «من تاريخ» و«إلى تاريخ»، أو الصق كويري البحث في خانة RAW_QUERY.'); return;
+      alertSafe_('وضع «paid» يحتاج «من تاريخ» و«إلى تاريخ» (مثلاً 2026-01-01 → 2026-12-31)، أو الصق كويري البحث في RAW_QUERY.'); return;
     }
 
-    // 1) fetch + parse invoices (server-side: date + status + optional location IDs)
-    let invoices = Api.fetchAllInvoices(cfg);
+    const data = DataTable.read();
+    const cache = PlateCache.load();
 
-    // 2) client-side safety net (location + supplier by NAME)
+    // 1) fetch + client-side name filters (location/supplier)
+    let invoices = Api.fetchAllInvoices(cfg);
     const locNorm = Util.norm(cfg.location), supNorm = Util.norm(cfg.supplier);
     invoices = invoices.filter(inv => {
       if (locNorm && !cfg.locationIds) { const n = Util.norm(inv.location); if (n.indexOf(locNorm) === -1 && locNorm.indexOf(n) === -1) return false; }
@@ -300,90 +356,108 @@ function runDisbursementReport() {
       return true;
     });
 
-    // 3) enrich with plate (concurrent order-detail fetch)
-    const orderIds = [...new Set(invoices.map(i => i.orderId).filter(Boolean).map(String))];
-    const plates = Api.fetchOrderDetails(orderIds, cfg.token, t0 + CFG.SOFT_TIME_LIMIT_MS);
-    const truncated = plates.__truncated === true; delete plates.__truncated;
+    // 2) upsert one row per invoice (keyed by invoiceId — cars are NOT de-duplicated)
+    const now = Util.fmtDt(new Date(), cfg.tz);
+    invoices.forEach(inv => {
+      const iid = String(inv.invoiceId || ''); if (!iid) return;
+      let pos = data.idx[iid], row;
+      if (pos == null) { row = new Array(DATA_COLS).fill(''); row[DI.IID] = iid; data.rows.push(row); data.idx[iid] = data.rows.length - 1; }
+      else row = data.rows[pos];
+      const oid = String(inv.orderId || '');
+      const sp = Util.datePrefix(inv.spendAt, cfg.tz);
+      row[DI.OID] = oid;
+      if (cache.has(oid)) row[DI.PLATE] = cache.get(oid) || '—';   // else keep whatever we had (or '')
+      row[DI.LOC] = inv.location; row[DI.SUP] = Util.dash(inv.supplier); row[DI.TYPE] = Util.dash(inv.type);
+      row[DI.AMOUNT] = (inv.amount !== '' && !isNaN(Number(inv.amount))) ? Number(inv.amount) : '';
+      row[DI.SPEND] = sp; row[DI.YEAR] = sp ? sp.substr(0, 4) : ''; row[DI.MONTH] = sp ? sp.substr(0, 7) : '';
+      row[DI.DUE] = Util.datePrefix(inv.dueAt, cfg.tz); row[DI.INV] = Util.datePrefix(inv.invAt, cfg.tz);
+      row[DI.PAY] = statusLabel_(inv.status); row[DI.MODE] = cfg.mode;
+      row[DI.MATCH] = matchLabel_(cfg, sp);
+      row[DI.UPDATED] = now;
+    });
 
-    // 4) build rows + verify «تاريخ الصرف» matches the chosen range
-    const rows = invoices.map(inv => {
-      const plate = inv.orderId ? (plates[String(inv.orderId)] || '') : '';
-      const dp = Util.datePrefix(inv.spendAt, cfg.tz);
-      let match;
-      if (cfg.mode === 'unpaid') match = 'غير مصروفة';
-      else if (!dp) match = '⚠️ لا يوجد تاريخ صرف';
-      else if (cfg.dateFrom && cfg.dateTo) match = (dp >= cfg.dateFrom && dp <= cfg.dateTo) ? '✅ مطابق' : '⚠️ خارج النطاق (' + dp + ')';
-      else match = dp;
-      return {
-        orderId: inv.orderId || '—', invoiceId: inv.invoiceId || '—',
-        plate: plate || '⚠️ غير متوفر', location: inv.location,
-        supplier: Util.dash(inv.supplier), type: Util.dash(inv.type), amount: Util.dash(inv.amount),
-        spend: inv.spendAt ? Util.fmtDt(inv.spendAt, cfg.tz) : '—',
-        due: inv.dueAt ? Util.fmtDt(inv.dueAt, cfg.tz) : '—',
-        payStatus: statusLabel_(inv.status),
-        match
-      };
-    }).sort((a, b) => String(a.location).localeCompare(String(b.location)));
+    // 3) enrich plates (cached, time-boxed)
+    enrichPlates_(data, cache, cfg, t0 + CFG.SOFT_TIME_LIMIT_MS);
 
-    renderReport_(rows, cfg, truncated);
+    DataTable.write(data.rows);
+    PlateCache.save(cache);
 
+    const pending = data.rows.filter(r => !String(r[DI.PLATE] || '').trim()).length;
     const secs = Math.round((Date.now() - t0) / 1000);
-    notify_(`تم في ${secs}ث · النتائج ${rows.length}` + (truncated ? ' · (بعض اللوحات ستكتمل لاحقًا)' : ''));
+    notify_(`تم في ${secs}ث · فواتير ${data.rows.length}` + (pending ? ` · لوحات ناقصة ${pending} (شغّل «إكمال جلب اللوحات»)` : ' · كل اللوحات مكتملة'));
   } catch (e) {
-    if (e instanceof AuthError) { notify_('انتهت صلاحية التوكن (HTTP ' + e.code + '). جدّد التوكن.'); }
+    if (e instanceof AuthError) notify_('انتهت صلاحية التوكن (HTTP ' + e.code + '). جدّد التوكن.');
     else { notify_('خطأ: ' + e.message); console.error(e.stack || e); }
   } finally { lock.releaseLock(); }
 }
 
-/* ════════════════════════════ RENDER ════════════════════════════ */
-function renderReport_(rows, cfg, truncated) {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(CFG.SH_REPORT) || ss.insertSheet(CFG.SH_REPORT);
-  sh.clearContents(); sh.clearFormats();
-
-  const scope = cfg.mode === 'unpaid'
-    ? 'غير المصروفة (بدون تاريخ صرف)'
-    : (cfg.rawQuery ? 'مصروفة — حسب فلترة الأدمن' : `مصروفة من ${cfg.dateFrom} إلى ${cfg.dateTo}`);
-  const title = `تقرير صرف الفواتير — ${scope}` +
-                (cfg.location ? ` · المركز: ${cfg.location}` : (cfg.locationIds ? ` · مكان الصرف #${cfg.locationIds}` : '')) +
-                (cfg.supplier ? ` · المورد: ${cfg.supplier}` : (cfg.supplierIds ? ` · مورد #${cfg.supplierIds}` : '')) +
-                ` · ${Util.fmtDt(new Date(), cfg.tz)}` + (truncated ? ' · (تحديث جزئي)' : '');
-
-  const header = ['رقم الطلب', 'رقم الفاتورة', 'رقم اللوحة', 'مكان الصرف', 'مورد الصرف', 'نوع الصرف',
-    'مبلغ الصرف', 'تاريخ الصرف', 'تاريخ الاستحقاق', 'حالة الدفع', 'مطابقة التاريخ'];
-  const COLS = header.length;
-
-  sh.getRange(1, 1, 1, COLS).merge().setValue(title)
-    .setBackground(CFG.C_HDR).setFontColor('#fff').setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.setRowHeight(1, 40);
-  sh.getRange(2, 1, 1, COLS).setValues([header])
-    .setBackground('#1565c0').setFontColor('#fff').setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center');
-  sh.setFrozenRows(2);
-
-  if (rows.length) {
-    const body = rows.map(r => [r.orderId, r.invoiceId, r.plate, r.location, r.supplier, r.type, r.amount, r.spend, r.due, r.payStatus, r.match]);
-    const rng = sh.getRange(3, 1, body.length, COLS);
-    rng.setNumberFormat('@');
-    rng.setValues(body.map(row => row.map(Util.safeText)));
-    const bg = rows.map((r, i) => Array(COLS).fill(
-      String(r.match).indexOf('⚠️') > -1 || String(r.plate).indexOf('⚠️') > -1 ? CFG.C_ORG
-      : (String(r.match).indexOf('✅') > -1 ? CFG.C_GRN : (i % 2 ? CFG.C_EVEN : CFG.C_ODD))));
-    rng.setBackgrounds(bg);
-  } else {
-    sh.getRange(3, 1).setValue('لا توجد نتائج بهذه الفلاتر.');
-  }
-  [110, 110, 140, 230, 190, 150, 110, 150, 150, 130, 175].forEach((w, i) => sh.setColumnWidth(i + 1, w));
-  SpreadsheetApp.setActiveSheet(sh);
+/** Phase-2 only: finish missing plates WITHOUT re-fetching the invoice list. */
+function enrichPlatesRun() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) { notify_('هناك تشغيل جارٍ — تم التخطّي.'); return; }
+  const t0 = Date.now();
+  try {
+    const cfg = getConfig_();
+    if (!cfg.token || cfg.token.length < 30) { notify_('التوكن غير موجود.'); return; }
+    const data = DataTable.read();
+    if (!data.rows.length) { notify_('لا توجد بيانات بعد — شغّل «سحب/تحديث البيانات» أولًا.'); return; }
+    const cache = PlateCache.load();
+    enrichPlates_(data, cache, cfg, t0 + CFG.SOFT_TIME_LIMIT_MS);
+    DataTable.write(data.rows);
+    PlateCache.save(cache);
+    const pending = data.rows.filter(r => !String(r[DI.PLATE] || '').trim()).length;
+    notify_(pending ? `باقٍ ${pending} لوحة — أعِد التشغيل.` : 'اكتملت كل اللوحات ✅');
+  } catch (e) {
+    if (e instanceof AuthError) notify_('انتهت صلاحية التوكن (HTTP ' + e.code + ').');
+    else { notify_('خطأ: ' + e.message); console.error(e.stack || e); }
+  } finally { lock.releaseLock(); }
 }
 
-/* ════════════════════════════ MENU / SETUP ════════════════════════════ */
+/** Fetch plates for orders not yet cached, time-boxed; apply cache to all rows. */
+function enrichPlates_(data, cache, cfg, deadline) {
+  const need = [...new Set(data.rows.filter(r => !String(r[DI.PLATE] || '').trim() && r[DI.OID]).map(r => String(r[DI.OID])))].filter(id => !cache.has(id));
+  if (need.length) {
+    const plates = Api.fetchOrderDetails(need, cfg.token, deadline);
+    delete plates.__truncated;
+    Object.keys(plates).forEach(id => cache.set(id, plates[id]));   // store result (even '' = fetched, no retry)
+  }
+  data.rows.forEach(r => { const oid = String(r[DI.OID] || ''); if (!String(r[DI.PLATE] || '').trim() && cache.has(oid)) r[DI.PLATE] = cache.get(oid) || '—'; });
+}
+
+function matchLabel_(cfg, sp) {
+  if (cfg.mode === 'unpaid') return 'غير مصروفة';
+  if (!sp) return '⚠️ لا يوجد تاريخ صرف';
+  if (cfg.dateFrom && cfg.dateTo) return (sp >= cfg.dateFrom && sp <= cfg.dateTo) ? '✅ مطابق' : '⚠️ خارج النطاق';
+  return sp;
+}
+
+/** Trigger tick: finish plates first if any are pending, else do a full sync. */
+function syncTick() {
+  const data = DataTable.read();
+  const pending = data.rows.filter(r => !String(r[DI.PLATE] || '').trim()).length;
+  if (pending > 0) enrichPlatesRun(); else syncDisbursementData();
+}
+
+/* ════════════════════════════ MENU / TRIGGERS / SETUP ════════════════════════════ */
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('تقرير الصرف')
-    .addItem('▶ تشغيل التقرير الآن', 'runDisbursementReport')
+  SpreadsheetApp.getUi().createMenu('بيانات الصرف')
+    .addItem('▶ سحب / تحديث البيانات', 'syncDisbursementData')
+    .addItem('🚗 إكمال جلب اللوحات', 'enrichPlatesRun')
     .addSeparator()
     .addItem('🔐 حفظ التوكن (آمن)', 'setToken')
     .addItem('⚙ إعداد الشيت أول مرة', 'initSheets')
+    .addItem('⏰ تفعيل التحديث التلقائي (كل 10 دقائق)', 'setupTriggers')
+    .addItem('🗑 حذف التريغرات', 'removeTriggers')
     .addToUi();
+}
+
+function setupTriggers() {
+  removeTriggers();
+  ScriptApp.newTrigger('syncTick').timeBased().everyMinutes(10).create();
+  alertSafe_('تم تفعيل التحديث التلقائي كل 10 دقائق (يكمل اللوحات ثم يحدّث البيانات).');
+}
+function removeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === 'syncTick') ScriptApp.deleteTrigger(t); });
 }
 
 function initSheets() {
@@ -394,10 +468,10 @@ function initSheets() {
     ['الإعداد', 'القيمة'],
     ['التوكن (JWT)', 'استخدم زر «حفظ التوكن (آمن)»'],
     ['الوضع (paid = مصروفة / unpaid = غير مصروفة)', 'paid'],
-    ['من تاريخ الصرف (YYYY-MM-DD)', ''],
-    ['إلى تاريخ الصرف (YYYY-MM-DD)', ''],
+    ['من تاريخ الصرف (YYYY-MM-DD)', '2026-01-01'],
+    ['إلى تاريخ الصرف (YYYY-MM-DD)', '2026-12-31'],
     ['اسم المركز (فلترة بالاسم) — فارغ = الكل', ''],
-    ['purchaseLocationsIds (اختياري: فلترة بالـID، أدق)', ''],
+    ['purchaseLocationsIds (اختياري: فلترة بالـID)', ''],
     ['اسم مورد الصرف (فلترة بالاسم) — فارغ = الكل', ''],
     ['spendSupplierIds (اختياري: فلترة المورد بالـID)', ''],
     ['حالات الدفع (فارغ=تلقائي: paid→1,3 / unpaid→2)', ''],
@@ -406,11 +480,12 @@ function initSheets() {
   ]);
   set.getRange(1, 1, 1, 2).setBackground('#37474f').setFontColor('#fff').setFontWeight('bold');
   set.setColumnWidth(1, 360); set.setColumnWidth(2, 480); set.setFrozenRows(1);
-  ss.getSheetByName(CFG.SH_REPORT) || ss.insertSheet(CFG.SH_REPORT);
-  alertSafe_('تم الإعداد!\n1) احفظ التوكن.\n2) اضبط الوضع والتواريخ واسم المركز (أو الـID).\n3) شغّل «تشغيل التقرير الآن».\n\n' +
-             'ملاحظة: مكان الصرف بالـID أدق (purchaseLocationsIds). بالاسم تتم الفلترة داخليًا.');
+  DataTable.sheet_(); PlateCache.sheet_();
+  alertSafe_('تم الإعداد!\n1) احفظ التوكن.\n2) لسحب سنة 2026 المسددة: الوضع paid، والتاريخ 2026-01-01 → 2026-12-31.\n' +
+             '3) «سحب / تحديث البيانات»، ثم «إكمال جلب اللوحات» حتى تكتمل، أو فعّل التحديث التلقائي.\n' +
+             '4) اربط Looker Studio بتبويب «بيانات الصرف».\n\nملاحظة: كل فاتورة = صف؛ السيارة المكرّرة تظهر بعدد فواتيرها (لا يوجد حذف تكرار).');
 }
 
 /* ════════════════════════════ MESSAGING ════════════════════════════ */
-function notify_(msg) { try { SpreadsheetApp.getActive().toast(msg, 'تقرير الصرف', 6); } catch(e){} console.log('[notify] ' + msg); }
+function notify_(msg) { try { SpreadsheetApp.getActive().toast(msg, 'بيانات الصرف', 6); } catch(e){} console.log('[notify] ' + msg); }
 function alertSafe_(msg) { try { SpreadsheetApp.getUi().alert(msg); } catch(e){ notify_(msg); } }

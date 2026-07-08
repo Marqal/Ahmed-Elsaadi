@@ -12,7 +12,7 @@ const Utilities = {
 };
 const ctx = { console, Utilities, SpreadsheetApp: {}, UrlFetchApp: {}, PropertiesService: {}, LockService: {} };
 vm.createContext(ctx);
-vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,normalizeDate_,statusLabel_});', ctx);
+vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,DI,DATA_COLS,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,normalizeDate_,statusLabel_,matchLabel_});', ctx);
 
 let pass = 0, fail = 0;
 const eq = (n, g, w) => { const ok = JSON.stringify(g) === JSON.stringify(w); console.log((ok ? '✅' : '❌') + ' ' + n + (ok ? '' : `  got=${JSON.stringify(g)} want=${JSON.stringify(w)}`)); ok ? pass++ : fail++; };
@@ -70,6 +70,32 @@ eq('parse status=2 → unpaid', ctx.parseInvoice_({ id: 1, status: 2 }).paid, fa
 eq('parse status carried from query', ctx.parseInvoice_({ id: 1 }, '3').status, '3');
 eq('statusLabel 1', ctx.statusLabel_(1), 'تم الدفع');
 eq('statusLabel 3', ctx.statusLabel_('3'), 'الدفع بالأجل');
+
+// date-match label
+eq('match in range', ctx.matchLabel_({ mode: 'paid', dateFrom: '2026-01-01', dateTo: '2026-12-31' }, '2026-07-01'), '✅ مطابق');
+eq('match out of range', ctx.matchLabel_({ mode: 'paid', dateFrom: '2026-07-01', dateTo: '2026-07-31' }, '2026-06-30'), '⚠️ خارج النطاق');
+eq('match unpaid', ctx.matchLabel_({ mode: 'unpaid' }, ''), 'غير مصروفة');
+eq('match no date', ctx.matchLabel_({ mode: 'paid', dateFrom: '2026-01-01', dateTo: '2026-12-31' }, ''), '⚠️ لا يوجد تاريخ صرف');
+
+// ── NO-DEDUP invariant: upsert is keyed by invoiceId, so the SAME car/order with
+// two different invoices produces TWO rows (a car serviced twice must not collapse).
+(function () {
+  const DI = ctx.DI, DATA_COLS = ctx.DATA_COLS;
+  const rows = [], idx = {};
+  const upsert = inv => {
+    const iid = String(inv.invoiceId);
+    let pos = idx[iid], row;
+    if (pos == null) { row = new Array(DATA_COLS).fill(''); row[DI.IID] = iid; rows.push(row); idx[iid] = rows.length - 1; }
+    else row = rows[pos];
+    row[DI.OID] = String(inv.orderId); row[DI.PLATE] = inv.plate;
+  };
+  // same order 5001 / same plate, but TWO invoices (two services)
+  upsert({ invoiceId: 'A1', orderId: 5001, plate: '3039 ا س ط' });
+  upsert({ invoiceId: 'A2', orderId: 5001, plate: '3039 ا س ط' });
+  upsert({ invoiceId: 'A1', orderId: 5001, plate: '3039 ا س ط' });   // re-sync same invoice → updates, no new row
+  eq('two invoices same car → 2 rows', rows.length, 2);
+  eq('re-sync does not duplicate', Object.keys(idx).length, 2);
+})();
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
