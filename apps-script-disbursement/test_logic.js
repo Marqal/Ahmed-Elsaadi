@@ -12,7 +12,7 @@ const Utilities = {
 };
 const ctx = { console, Utilities, SpreadsheetApp: {}, UrlFetchApp: {}, PropertiesService: {}, LockService: {} };
 vm.createContext(ctx);
-vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,DI,DATA_COLS,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,deepFindName_,normalizeDate_,statusLabel_,matchLabel_});', ctx);
+vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,DI,DATA_COLS,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,deepFindName_,normalizeDate_,statusLabel_,matchLabel_,summarizeSorted_});', ctx);
 
 let pass = 0, fail = 0;
 const eq = (n, g, w) => { const ok = JSON.stringify(g) === JSON.stringify(w); console.log((ok ? '✅' : '❌') + ' ' + n + (ok ? '' : `  got=${JSON.stringify(g)} want=${JSON.stringify(w)}`)); ok ? pass++ : fail++; };
@@ -119,6 +119,25 @@ eq('supplier via paymentMethod.name', ctx.deepFindName_({ paymentMethod: { name:
 eq('supplier skips numeric id', ctx.deepFindName_({ paymentMethodId: 3 }, supRe, 0), '');
 eq('supplier deep nested', ctx.deepFindName_({ foo: { spendSupplier: { name: 'بطاقة ناصر' } } }, supRe, 0), 'بطاقة ناصر');
 eq('parseInvoice supplier fallback', ctx.parseInvoice_({ id: 1, foo: { spendSupplier: { name: 'X' } } }).supplier, 'X');
+
+// ── SUMMARY: SUM(amount) + count grouped, with grand total (for the download sheet)
+(function () {
+  const DI = ctx.DI, DATA_COLS = ctx.DATA_COLS;
+  const mk = (spend, loc, amt) => { const r = new Array(DATA_COLS).fill(''); r[DI.SPEND] = spend; r[DI.LOC] = loc; r[DI.AMOUNT] = amt; return r; };
+  const rows = [
+    mk('2026-07-01', 'مركز أ', 100),
+    mk('2026-07-01', 'مركز ب', 200),
+    mk('2026-07-02', 'مركز أ', 50),
+  ];
+  const byDate = ctx.summarizeSorted_(rows, DI.SPEND, 'keyAsc');
+  eq('summary date keys sorted', byDate.list.map(x => x.key), ['2026-07-01', '2026-07-02']);
+  eq('summary date totals', byDate.list.map(x => x.total), [300, 50]);   // 07-01 = 100+200
+  eq('summary grand total', byDate.gTotal, 350);
+  eq('summary grand count', byDate.gCount, 3);
+  const byLoc = ctx.summarizeSorted_(rows, DI.LOC, 'totalDesc');   // مركز أ=150, مركز ب=200
+  eq('summary loc sorted by total desc', byLoc.list.map(x => x.key), ['مركز ب', 'مركز أ']);
+  eq('summary loc totals', byLoc.list.map(x => x.total), [200, 150]);
+})();
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

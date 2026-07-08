@@ -1,6 +1,8 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.4            ║
+ * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.5            ║
+ * ║  v1.5: «📊 ملخص الصرف» (إجماليات SUM حسب التاريخ/المركز/المورد/الشهر +         ║
+ * ║        إجمالي كلي) + فلاتر مركز/مورد متعددة (فاصلة) + LOOKER_GUIDE.md.        ║
  * ║  STANDALONE script — separate from the audit-monitoring script.            ║
  * ║  v1.3: paginate until empty page (was stopping at ~200 due to data.total);  ║
  * ║        broaden «مورد الصرف» detection + «🔍 فحص عيّنة» debug dump.            ║
@@ -33,9 +35,10 @@
 
 /* ════════════════════════════ CONFIG ════════════════════════════ */
 const CFG = {
-  SH_SET:   'الاعدادات',
-  SH_DATA:  'بيانات الصرف',        // ← مصدر Looker (صف لكل فاتورة، upsert)
-  SH_CACHE: '__plate_cache',       // hidden: orderId → plate
+  SH_SET:     'الاعدادات',
+  SH_DATA:    'بيانات الصرف',      // ← مصدر Looker (صف لكل فاتورة، upsert)
+  SH_SUMMARY: 'ملخص الصرف',        // ← إجماليات (تحميل/طباعة) حسب التاريخ/المركز/المورد
+  SH_CACHE:   '__plate_cache',     // hidden: orderId → plate
 
   API_BASE: 'https://api.mismarapp.com',
   ORIGIN:   'https://admin.mismarapp.com',
@@ -423,10 +426,13 @@ function syncDisbursementData() {
     // 1) fetch + client-side name filters (location/supplier)
     let invoices = Api.fetchAllInvoices(cfg);
     const partial = invoices.__partial === true;
-    const locNorm = Util.norm(cfg.location), supNorm = Util.norm(cfg.supplier);
+    // ── multi-value filters: comma-separated names → match ANY (مركز/مورد)
+    const locTerms = cfg.location ? cfg.location.split(',').map(s => Util.norm(s)).filter(Boolean) : [];
+    const supTerms = cfg.supplier ? cfg.supplier.split(',').map(s => Util.norm(s)).filter(Boolean) : [];
+    const anyMatch = (terms, val) => { const n = Util.norm(val); return terms.some(t => n.indexOf(t) > -1 || t.indexOf(n) > -1); };
     invoices = invoices.filter(inv => {
-      if (locNorm && !cfg.locationIds) { const n = Util.norm(inv.location); if (n.indexOf(locNorm) === -1 && locNorm.indexOf(n) === -1) return false; }
-      if (supNorm && !cfg.supplierIds) { const n = Util.norm(inv.supplier); if (n.indexOf(supNorm) === -1 && supNorm.indexOf(n) === -1) return false; }
+      if (locTerms.length && !cfg.locationIds && !anyMatch(locTerms, inv.location)) return false;
+      if (supTerms.length && !cfg.supplierIds && !anyMatch(supTerms, inv.supplier)) return false;
       return true;
     });
 
@@ -517,6 +523,59 @@ function syncTick() {
   if (pending > 0) enrichPlatesRun(); else syncDisbursementData();
 }
 
+/* ════════════════════════════ SUMMARY (totals for download / print) ════════════════════════════
+ * Builds «ملخص الصرف»: SUM(amount)+count grouped by date / center / supplier, each
+ * with a grand-total row. Answers «إجمالي تحت كل مبلغ» (total per date) and «توتال
+ * تحت» (grand total) in a downloadable sheet. */
+function summarizeSorted_(rows, keyIdx, order) {
+  const map = {}; let gCount = 0, gTotal = 0;
+  rows.forEach(r => {
+    const key = String(r[keyIdx] || '—') || '—';
+    const amt = Number(r[DI.AMOUNT]) || 0;
+    if (!map[key]) map[key] = { count: 0, total: 0 };
+    map[key].count++; map[key].total += amt; gCount++; gTotal += amt;
+  });
+  const round2 = x => Math.round(x * 100) / 100;
+  let keys = Object.keys(map);
+  keys.sort(order === 'keyAsc' ? undefined : (a, b) => map[b].total - map[a].total);
+  return { list: keys.map(k => ({ key: k, count: map[k].count, total: round2(map[k].total) })), gCount, gTotal: round2(gTotal) };
+}
+
+function writeSummaryBlock_(sh, R, title, keyLabel, summary) {
+  sh.getRange(R, 1, 1, 3).merge().setValue(title)
+    .setBackground('#0d1b2a').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
+  sh.getRange(R, 1, 1, 3).setValues([[keyLabel, 'عدد الفواتير', 'إجمالي المبلغ']])
+    .setBackground('#1565c0').setFontColor('#fff').setFontWeight('bold').setHorizontalAlignment('center'); R++;
+  const body = summary.list.map(x => [x.key, x.count, x.total]);
+  body.push(['الإجمالي الكلي', summary.gCount, summary.gTotal]);
+  const start = R;
+  sh.getRange(R, 1, body.length, 3).setValues(body.map(r => [Util.safeText(r[0]), r[1], r[2]]));
+  sh.getRange(R, 3, body.length, 1).setNumberFormat('#,##0.00');   // amount sums on download
+  sh.getRange(start + body.length - 1, 1, 1, 3).setBackground('#37474f').setFontColor('#fff').setFontWeight('bold');
+  return start + body.length;
+}
+
+/** Menu: build «ملخص الصرف» from «بيانات الصرف». */
+function buildDisbursementSummary() {
+  const data = DataTable.read();
+  if (!data.rows.length) { alertSafe_('لا توجد بيانات — شغّل «سحب / تحديث البيانات» أولًا.'); return; }
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CFG.SH_SUMMARY) || ss.insertSheet(CFG.SH_SUMMARY);
+  sh.clear();
+  const cfg = getConfig_();
+  sh.getRange(1, 1, 1, 3).merge().setValue(`ملخص الصرف — ${data.rows.length} فاتورة · ${Util.fmtDt(new Date(), cfg.tz)}`)
+    .setBackground('#1b5e20').setFontColor('#fff').setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
+  let R = 3;
+  R = writeSummaryBlock_(sh, R, 'إجمالي حسب تاريخ الصرف', 'تاريخ الصرف', summarizeSorted_(data.rows, DI.SPEND, 'keyAsc')); R += 1;
+  R = writeSummaryBlock_(sh, R, 'إجمالي حسب مكان الصرف', 'المركز', summarizeSorted_(data.rows, DI.LOC, 'totalDesc')); R += 1;
+  R = writeSummaryBlock_(sh, R, 'إجمالي حسب مورد الصرف', 'المورد', summarizeSorted_(data.rows, DI.SUP, 'totalDesc')); R += 1;
+  R = writeSummaryBlock_(sh, R, 'إجمالي حسب الشهر', 'الشهر', summarizeSorted_(data.rows, DI.MONTH, 'keyAsc'));
+  [200, 120, 150].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  sh.setFrozenRows(1);
+  SpreadsheetApp.setActiveSheet(sh);
+  alertSafe_('تم بناء «ملخص الصرف»: إجماليات حسب التاريخ/المركز/المورد/الشهر + الإجمالي الكلي.\nتنزيل: File → Download → Excel/CSV.');
+}
+
 /* ════════════════════════════ DEBUG: dump one raw item's field names ════════════════════════════
  * When a column comes out empty (e.g. «مورد الصرف»), run this to see the ACTUAL
  * JSON keys of one cost-invoice item + one order detail, so the field mapping can
@@ -569,6 +628,7 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('بيانات الصرف')
     .addItem('▶ سحب / تحديث البيانات', 'syncDisbursementData')
     .addItem('🚗 إكمال جلب اللوحات', 'enrichPlatesRun')
+    .addItem('📊 بناء ملخص الصرف (إجماليات)', 'buildDisbursementSummary')
     .addSeparator()
     .addItem('🔍 فحص عيّنة (Debug)', 'debugSample')
     .addItem('🔐 حفظ التوكن (آمن)', 'setToken')
@@ -597,10 +657,10 @@ function initSheets() {
     ['الوضع (paid = مصروفة / unpaid = غير مصروفة)', 'paid'],
     ['من تاريخ الصرف (YYYY-MM-DD)', '2026-01-01'],
     ['إلى تاريخ الصرف (YYYY-MM-DD)', '2026-12-31'],
-    ['اسم المركز (فلترة بالاسم) — فارغ = الكل', ''],
-    ['purchaseLocationsIds (اختياري: فلترة بالـID)', ''],
-    ['اسم مورد الصرف (فلترة بالاسم) — فارغ = الكل', ''],
-    ['spendSupplierIds (اختياري: فلترة المورد بالـID)', ''],
+    ['اسم المركز (يفصل بينهم فاصلة للأكثر) — فارغ = الكل', ''],
+    ['purchaseLocationsIds (اختياري: فلترة بالـID، تفصل بفاصلة)', ''],
+    ['اسم مورد الصرف (يفصل بينهم فاصلة للأكثر) — فارغ = الكل', ''],
+    ['spendSupplierIds (اختياري: فلترة المورد بالـID، تفصل بفاصلة)', ''],
     ['حالات الدفع (فارغ=تلقائي: paid→1,3 / unpaid→2)', ''],
     ['المنطقة الزمنية', CFG.DEF_TZ],
     ['RAW_QUERY (اختياري: الصق كويري البحث من الأدمن)', '']
