@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>نموذج لوحة الصرف — مسمار (Looker mockup)</title>
+<style>*{box-sizing:border-box}html,body{margin:0;padding:0}body{min-height:100vh;background:#eef2f7}@media (prefers-color-scheme:dark){body{background:#0b131c}}</style>
+</head>
+<body>
+<div class="app" dir="rtl" lang="ar">
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div class="brand-txt">
+        <h1>لوحة الصرف — كشوف الحساب</h1>
+        <p class="sub">فواتير التكلفة B2B · مصروفة · <span class="mono">1–6 يوليو 2026</span></p>
+      </div>
+    </div>
+    <div class="live"><span class="dot"></span> محدّث الآن</div>
+  </header>
+
+  <!-- these mirror the Looker "controls": one clean row, consistent width -->
+  <section class="filters" aria-label="عوامل التصفية">
+    <button class="ctrl"><span class="lbl">رقم اللوحة</span><span class="val">الكل</span><span class="caret">▾</span></button>
+    <button class="ctrl"><span class="lbl">تاريخ الصرف</span><span class="val mono">1–6 يوليو</span><span class="caret">▾</span></button>
+    <button class="ctrl"><span class="lbl">مكان الصرف</span><span class="val">بشر كنترول — سكاكا</span><span class="caret">▾</span></button>
+    <button class="ctrl"><span class="lbl">مورد الصرف</span><span class="val">بطاقة عبدالعزيز الزعيبي</span><span class="caret">▾</span></button>
+    <button class="ctrl"><span class="lbl">حالة الدفع</span><span class="val">تم الدفع</span><span class="caret">▾</span></button>
+  </section>
+
+  <!-- summary before detail: KPI scorecards replace the one-row pivot -->
+  <section class="kpis" aria-label="المؤشرات">
+    <article class="kpi accent">
+      <p class="k-lbl">إجمالي المبلغ</p>
+      <p class="k-num"><span class="mono">26,406</span> <span class="unit">ر.س</span></p>
+      <p class="k-foot">خلال الفترة المحددة</p>
+    </article>
+    <article class="kpi">
+      <p class="k-lbl">عدد الفواتير</p>
+      <p class="k-num mono">26</p>
+      <p class="k-foot">صف لكل فاتورة</p>
+    </article>
+    <article class="kpi">
+      <p class="k-lbl">متوسط الفاتورة</p>
+      <p class="k-num"><span class="mono">1,016</span> <span class="unit">ر.س</span></p>
+      <p class="k-foot">الإجمالي ÷ العدد</p>
+    </article>
+    <article class="kpi">
+      <p class="k-lbl">أعلى فاتورة</p>
+      <p class="k-num"><span class="mono">2,560</span> <span class="unit">ر.س</span></p>
+      <p class="k-foot">اللوحة ٢٧٧٧ اسص</p>
+    </article>
+  </section>
+
+  <section class="grid">
+    <!-- detail table with a real total row -->
+    <article class="panel table-panel">
+      <div class="p-head">
+        <h2>تفاصيل الصرف</h2>
+        <span class="count">26 فاتورة</span>
+      </div>
+      <div class="t-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="c-plate">رقم اللوحة</th>
+              <th class="c-date">تاريخ الصرف</th>
+              <th class="c-loc">مكان الصرف</th>
+              <th class="c-pay">حالة الدفع</th>
+              <th class="c-amt">المبلغ (ر.س)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td class="plate">٢٧٧٧ اسص</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">2,560</td></tr>
+            <tr><td class="plate">٤١٥٨ هصا</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">1,860</td></tr>
+            <tr><td class="plate">٤٧٨٥ بيد</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">1,200</td></tr>
+            <tr><td class="plate">١٤٩٠ عمر</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">1,120</td></tr>
+            <tr><td class="plate">٢٤١٥ لعب</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">1,080</td></tr>
+            <tr><td class="plate">ذنغ 2707</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">600</td></tr>
+            <tr><td class="plate">٢٢٨٤ بيل</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">600</td></tr>
+            <tr><td class="plate">٣٥٧١ بمص</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">590</td></tr>
+            <tr><td class="plate">٢٨٠٧ عبر</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">400</td></tr>
+            <tr><td class="plate">٣٦١٤ حعب</td><td class="mono date">2026-07-06</td><td class="loc">بشر كنترول — سكاكا</td><td><span class="pill ok">تم الدفع</span></td><td class="amt mono">300</td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td colspan="4">الإجمالي · <span class="muted">26 فاتورة</span></td><td class="amt mono total">26,406</td></tr>
+          </tfoot>
+        </table>
+      </div>
+      <p class="t-note">صفّ الإجمالي أسفل الجدول (Show summary row) + تنسيق المبلغ كعملة.</p>
+    </article>
+
+    <!-- a bar chart earns its place where the pivot didn't: comparison at a glance -->
+    <article class="panel chart-panel">
+      <div class="p-head">
+        <h2>أعلى الفواتير حسب المبلغ</h2>
+        <span class="count mono">ر.س</span>
+      </div>
+      <ul class="bars">
+        <li><span class="b-lbl">٢٧٧٧ اسص</span><span class="b-track"><span class="b-fill" style="inline-size:100%"></span></span><span class="b-val mono">2,560</span></li>
+        <li><span class="b-lbl">٤١٥٨ هصا</span><span class="b-track"><span class="b-fill" style="inline-size:72.7%"></span></span><span class="b-val mono">1,860</span></li>
+        <li><span class="b-lbl">٤٧٨٥ بيد</span><span class="b-track"><span class="b-fill" style="inline-size:46.9%"></span></span><span class="b-val mono">1,200</span></li>
+        <li><span class="b-lbl">١٤٩٠ عمر</span><span class="b-track"><span class="b-fill" style="inline-size:43.8%"></span></span><span class="b-val mono">1,120</span></li>
+        <li><span class="b-lbl">٢٤١٥ لعب</span><span class="b-track"><span class="b-fill" style="inline-size:42.2%"></span></span><span class="b-val mono">1,080</span></li>
+        <li><span class="b-lbl">ذنغ 2707</span><span class="b-track"><span class="b-fill" style="inline-size:23.4%"></span></span><span class="b-val mono">600</span></li>
+        <li><span class="b-lbl">٣٥٧١ بمص</span><span class="b-track"><span class="b-fill" style="inline-size:23.0%"></span></span><span class="b-val mono">590</span></li>
+        <li><span class="b-lbl">٢٨٠٧ عبر</span><span class="b-track"><span class="b-fill" style="inline-size:15.6%"></span></span><span class="b-val mono">400</span></li>
+      </ul>
+      <p class="t-note">بديل البيفوت: شريطي للمقارنة (أو حسب المركز/المورد عند تعدّد القيم).</p>
+    </article>
+  </section>
+
+  <footer class="foot">
+    نموذج تصميم للمحاكاة في Looker Studio — ثلاث ترقيات: <b>سكوركارد</b> بالأعلى بدل صف البيفوت،
+    <b>جدول منسّق</b> بإجمالي أسفل وعملة، و<b>رسم شريطي</b> للمقارنة. البيانات من عيّنة 6 يوليو.
+  </footer>
+</div>
+
+<style>
+  :root {
+    --bg: #eef2f7; --paper: #ffffff; --panel-2: #f6f8fb;
+    --ink: #0e1a2b; --muted: #5c6b7e; --faint: #8494a6;
+    --line: #dce3ec; --line-strong: #c6d0dc;
+    --accent: #0f7a68; --accent-ink: #0a5c4f; --accent-wash: #e3f3ef;
+    --blue: #1f5fbf; --good: #12805c; --good-wash: #e4f4ec; --good-line: #bfe3d0;
+    --shadow: 0 1px 2px rgba(16,32,54,.06), 0 8px 24px -12px rgba(16,32,54,.14);
+    --r: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b131c; --paper: #131d29; --panel-2: #0f1822;
+      --ink: #e8eef7; --muted: #93a4b7; --faint: #6d7f92;
+      --line: #223040; --line-strong: #2c3d4f;
+      --accent: #3fbfa5; --accent-ink: #7fd8c6; --accent-wash: #12352e;
+      --blue: #6aa6ff; --good: #35c08c; --good-wash: #113126; --good-line: #1f4a3a;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 30px -16px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b131c; --paper: #131d29; --panel-2: #0f1822;
+    --ink: #e8eef7; --muted: #93a4b7; --faint: #6d7f92;
+    --line: #223040; --line-strong: #2c3d4f;
+    --accent: #3fbfa5; --accent-ink: #7fd8c6; --accent-wash: #12352e;
+    --blue: #6aa6ff; --good: #35c08c; --good-wash: #113126; --good-line: #1f4a3a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 30px -16px rgba(0,0,0,.6);
+  }
+  :root[data-theme="light"] {
+    --bg: #eef2f7; --paper: #ffffff; --panel-2: #f6f8fb;
+    --ink: #0e1a2b; --muted: #5c6b7e; --faint: #8494a6;
+    --line: #dce3ec; --line-strong: #c6d0dc;
+    --accent: #0f7a68; --accent-ink: #0a5c4f; --accent-wash: #e3f3ef;
+    --blue: #1f5fbf; --good: #12805c; --good-wash: #e4f4ec; --good-line: #bfe3d0;
+    --shadow: 0 1px 2px rgba(16,32,54,.06), 0 8px 24px -12px rgba(16,32,54,.14);
+  }
+
+  * { box-sizing: border-box; }
+  .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+  .app {
+    font-family: "Segoe UI", "Noto Kufi Arabic", "Noto Sans Arabic", Tahoma, system-ui, sans-serif;
+    background: var(--bg); color: var(--ink);
+    min-block-size: 100%; padding: clamp(16px, 3vw, 34px);
+    display: flex; flex-direction: column; gap: 18px;
+    -webkit-font-smoothing: antialiased; line-height: 1.5;
+  }
+
+  /* header */
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark { inline-size: 40px; block-size: 40px; border-radius: 11px; flex: none;
+    background: linear-gradient(145deg, var(--accent), var(--accent-ink));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.25); position: relative; }
+  .mark::after { content: "﷼"; position: absolute; inset: 0; display: grid; place-items: center;
+    color: #fff; font-size: 20px; font-weight: 700; opacity: .95; }
+  .brand-txt h1 { margin: 0; font-size: clamp(17px, 2.4vw, 21px); font-weight: 800; letter-spacing: -.01em; }
+  .sub { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .live { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted);
+    background: var(--paper); border: 1px solid var(--line); padding: 7px 12px; border-radius: 999px; box-shadow: var(--shadow); }
+  .live .dot { inline-size: 8px; block-size: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px var(--good-wash); }
+
+  /* filters */
+  .filters { display: flex; flex-wrap: wrap; gap: 10px; }
+  .ctrl { display: inline-flex; align-items: center; gap: 8px; font: inherit; cursor: pointer;
+    background: var(--paper); border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 13px; color: var(--ink); box-shadow: var(--shadow); transition: border-color .15s, transform .05s; }
+  .ctrl:hover { border-color: var(--line-strong); }
+  .ctrl:active { transform: translateY(1px); }
+  .ctrl:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ctrl .lbl { color: var(--faint); font-size: 11px; }
+  .ctrl .val { font-size: 13px; font-weight: 600; max-inline-size: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ctrl .caret { color: var(--muted); font-size: 11px; }
+
+  /* KPIs */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .kpi { background: var(--paper); border: 1px solid var(--line); border-radius: var(--r); padding: 16px 18px; box-shadow: var(--shadow);
+    position: relative; overflow: hidden; }
+  .kpi::before { content: ""; position: absolute; inset-block: 0; inset-inline-start: 0; inline-size: 3px; background: var(--line-strong); }
+  .kpi.accent::before { background: linear-gradient(var(--accent), var(--accent-ink)); }
+  .k-lbl { margin: 0; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .01em; }
+  .k-num { margin: 8px 0 0; font-size: clamp(24px, 3.4vw, 32px); font-weight: 800; letter-spacing: -.02em; line-height: 1; }
+  .kpi.accent .k-num { color: var(--accent); }
+  .k-num .unit { font-size: 14px; font-weight: 700; color: var(--muted); }
+  .k-foot { margin: 9px 0 0; font-size: 11.5px; color: var(--faint); }
+
+  /* panels + grid */
+  .grid { display: grid; grid-template-columns: 1.55fr 1fr; gap: 14px; align-items: start; }
+  .panel { background: var(--paper); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); overflow: hidden; }
+  .p-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 14px 18px 12px; border-block-end: 1px solid var(--line); }
+  .p-head h2 { margin: 0; font-size: 15px; font-weight: 800; }
+  .count { font-size: 12px; color: var(--muted); }
+
+  /* table */
+  .t-wrap { overflow-x: auto; }
+  table { inline-size: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { text-align: start; font-weight: 700; color: var(--muted); font-size: 11.5px; letter-spacing: .02em;
+    padding: 10px 18px; background: var(--panel-2); border-block-end: 1px solid var(--line); white-space: nowrap; }
+  tbody td { padding: 11px 18px; border-block-end: 1px solid var(--line); white-space: nowrap; }
+  tbody tr:last-child td { border-block-end: none; }
+  tbody tr:hover td { background: var(--panel-2); }
+  .plate { font-weight: 700; letter-spacing: .02em; }
+  .date { color: var(--muted); direction: ltr; }
+  .loc { color: var(--muted); }
+  .c-amt, .amt { text-align: end; }
+  .amt { font-weight: 700; direction: ltr; }
+  .pill { display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+  .pill.ok { color: var(--good); background: var(--good-wash); border: 1px solid var(--good-line); }
+  tfoot td { padding: 13px 18px; border-block-start: 2px solid var(--line-strong); font-weight: 700; background: var(--panel-2); }
+  tfoot .total { color: var(--accent); font-size: 15px; }
+  tfoot .muted { color: var(--muted); font-weight: 600; }
+  .t-note { margin: 0; padding: 11px 18px; font-size: 11.5px; color: var(--faint); border-block-start: 1px solid var(--line); }
+
+  /* bar chart */
+  .bars { list-style: none; margin: 0; padding: 14px 18px 6px; display: flex; flex-direction: column; gap: 12px; }
+  .bars li { display: grid; grid-template-columns: 74px 1fr auto; align-items: center; gap: 10px; }
+  .b-lbl { font-size: 12px; font-weight: 700; color: var(--ink); white-space: nowrap; }
+  .b-track { block-size: 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .b-fill { display: block; block-size: 100%; border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent-ink), var(--accent)); }
+  .b-val { font-size: 12.5px; font-weight: 700; color: var(--muted); direction: ltr; min-inline-size: 42px; text-align: end; }
+
+  .foot { color: var(--faint); font-size: 12px; text-align: center; padding-block: 6px 2px; line-height: 1.7; }
+  .foot b { color: var(--muted); font-weight: 700; }
+
+  @media (max-width: 860px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 460px) {
+    .kpis { grid-template-columns: 1fr 1fr; }
+    .ctrl .val { max-inline-size: 120px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</body>
+</html>
