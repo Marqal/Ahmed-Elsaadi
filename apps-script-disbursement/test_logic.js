@@ -12,7 +12,7 @@ const Utilities = {
 };
 const ctx = { console, Utilities, SpreadsheetApp: {}, UrlFetchApp: {}, PropertiesService: {}, LockService: {} };
 vm.createContext(ctx);
-vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,DI,DATA_COLS,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,normalizeDate_,statusLabel_,matchLabel_});', ctx);
+vm.runInContext(src + '\n;Object.assign(globalThis,{CFG,DI,DATA_COLS,Util,Api,get_,pick_,parseInvoice_,extractPlate_,plateFromCar_,deepFindPlate_,deepFindName_,normalizeDate_,statusLabel_,matchLabel_});', ctx);
 
 let pass = 0, fail = 0;
 const eq = (n, g, w) => { const ok = JSON.stringify(g) === JSON.stringify(w); console.log((ok ? '✅' : '❌') + ' ' + n + (ok ? '' : `  got=${JSON.stringify(g)} want=${JSON.stringify(w)}`)); ok ? pass++ : fail++; };
@@ -96,6 +96,29 @@ eq('match no date', ctx.matchLabel_({ mode: 'paid', dateFrom: '2026-01-01', date
   eq('two invoices same car → 2 rows', rows.length, 2);
   eq('re-sync does not duplicate', Object.keys(idx).length, 2);
 })();
+
+// ── PAGINATION: must pull ALL rows (empty-page stop), NOT stop at data.total.
+function fetchFactory(dataset, pageSize, opts) {
+  opts = opts || {};
+  return (url) => {
+    const m = String(url).match(/offset=(\d+)/); const off = m ? +m[1] : 0;
+    const slice = opts.repeat ? dataset.slice(0, pageSize) : dataset.slice(off, off + pageSize);
+    return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ data: { raw: slice, total: opts.total != null ? opts.total : dataset.length } }) };
+  };
+}
+const ds350 = Array.from({ length: 350 }, (_, i) => ({ id: 1000 + i, orderId: 2000 + i, status: 1 }));
+const cfgP = { rawQuery: '', statuses: ['1'], mode: 'paid', dateFrom: '2026-01-01', dateTo: '2026-12-31', locationIds: '', supplierIds: '' };
+ctx.UrlFetchApp = { fetch: fetchFactory(ds350, 100, { total: 200 }) };   // total UNDER-reports (the bug)
+eq('pagination pulls all 350 despite total=200', ctx.Api.fetchAllInvoices(cfgP).length, 350);
+ctx.UrlFetchApp = { fetch: fetchFactory(ds350, 100, { repeat: true, total: 9999 }) };  // server ignores offset
+eq('repeated page → dedup+stall stops at 100', ctx.Api.fetchAllInvoices(cfgP).length, 100);
+
+// ── SUPPLIER deep-scan (the «مورد الصرف» empty-column fix)
+const supRe = new RegExp(ctx.CFG.SUPPLIER_KEY_RE, 'i');
+eq('supplier via paymentMethod.name', ctx.deepFindName_({ paymentMethod: { name: 'حساب التشغيل' } }, supRe, 0), 'حساب التشغيل');
+eq('supplier skips numeric id', ctx.deepFindName_({ paymentMethodId: 3 }, supRe, 0), '');
+eq('supplier deep nested', ctx.deepFindName_({ foo: { spendSupplier: { name: 'بطاقة ناصر' } } }, supRe, 0), 'بطاقة ناصر');
+eq('parseInvoice supplier fallback', ctx.parseInvoice_({ id: 1, foo: { spendSupplier: { name: 'X' } } }).supplier, 'X');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

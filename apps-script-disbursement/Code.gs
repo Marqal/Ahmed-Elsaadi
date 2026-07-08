@@ -1,7 +1,9 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.2            ║
+ * ║  مسمار — بيانات صرف الفواتير (Disbursement Data for Looker)  v1.3            ║
  * ║  STANDALONE script — separate from the audit-monitoring script.            ║
+ * ║  v1.3: paginate until empty page (was stopping at ~200 due to data.total);  ║
+ * ║        broaden «مورد الصرف» detection + «🔍 فحص عيّنة» debug dump.            ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
  * الهدف: يسحب فواتير التكلفة B2B بالجملة (مثلاً كل المسددة لسنة 2026، أو غير المسددة)
@@ -38,9 +40,11 @@ const CFG = {
   ORDER_ENDPOINT: '/adminApi/v1/orders/',
 
   INV_LIMIT: 100,
-  MAX_PAGES: 300,                  // up to 30k invoices per status per run
+  MAX_PAGES: 2000,                 // backstop; real stop is an empty page
+  MAX_ROWS: 100000,                // hard safety cap on total invoices per run
   FETCH_CHUNK: 25,
   SOFT_TIME_LIMIT_MS: 4.7 * 60 * 1000,
+  FETCH_LIST_SOFT_MS: 3.5 * 60 * 1000,   // guard the list fetch so plates get time
   DEF_TZ: 'Asia/Riyadh',
 
   // Settings cells
@@ -59,7 +63,11 @@ const CFG = {
   F_INVOICE_ID:['id', 'invoiceId'],
   F_AMOUNT:    ['amount', 'spendAmount', 'total', 'value', 'cost', 'price', 'paidAmount'],
   F_TYPE:      ['spendType.name', 'costType.name', 'type.name', 'spendTypeName', 'costInvoiceType.name'],
-  F_SUPPLIER:  ['supplier.name', 'spendSupplier.name', 'disbursementSupplier.name', 'costSupplier.name', 'supplierName'],
+  F_SUPPLIER:  ['supplier.name', 'spendSupplier.name', 'disbursementSupplier.name', 'costSupplier.name', 'supplierName',
+                'paymentMethod.name', 'spendSource.name', 'paidFrom.name', 'paymentSource.name', 'wallet.name',
+                'bankCard.name', 'card.name', 'account.name', 'source.name', 'spendTo.name', 'vendor.name'],
+  // keys whose nested {name} counts as «مورد الصرف» when the explicit paths miss:
+  SUPPLIER_KEY_RE: 'supplier|مورد|spendfrom|paidfrom|paymentsource|paymentmethod|vendor|wallet|bankcard',
   F_LOCATION:  ['purchaseLocation.name', 'spendLocation.name', 'location.name', 'purchaseLocationName'],
   F_SPEND_AT:  ['paidDate', 'paidAt', 'spendDate', 'spendAt', 'disbursementDate', 'paymentDate'],
   F_DUE_AT:    ['dueDate', 'dueAt', 'entitlementDate'],
@@ -170,8 +178,9 @@ const Api = {
       'Accept-Language': 'ar', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
   },
 
-  buildQuery(cfg, status, page) {
-    const limit = CFG.INV_LIMIT, offset = (page - 1) * limit;
+  buildQuery(cfg, status, page, offset) {
+    const limit = CFG.INV_LIMIT;
+    if (offset == null) offset = (page - 1) * limit;   // default; caller passes rows-fetched-so-far
     if (cfg.rawQuery) {
       let q = cfg.rawQuery.replace(/([?&])(page|limit|offset)=[^&]*/g, '').replace(/^[?&]+|&+$/g, '').replace(/&&+/g, '&');
       return q + (q ? '&' : '') + `offset=${offset}&limit=${limit}&page=${page}`;
@@ -185,25 +194,45 @@ const Api = {
     return q;
   },
 
+  /** ── FIX v1.3: paginate until an EMPTY page (not until data.total, which the API
+   *  under-reports and truncated the pull to ~200). Offset advances by the rows
+   *  actually received (handles any server page size), and invoiceId de-dup stops
+   *  a stalled/repeated page. */
   fetchAllInvoices(cfg) {
     const rows = [];
+    const seen = new Set();
     const statusList = cfg.rawQuery ? [null] : (cfg.statuses.length ? cfg.statuses : [null]);
+    const deadline = Date.now() + CFG.FETCH_LIST_SOFT_MS;
+    let hitLimit = false;
     for (const status of statusList) {
+      let fetched = 0, stall = 0;
       for (let page = 1; page <= CFG.MAX_PAGES; page++) {
-        const url = `${CFG.API_BASE}${CFG.INV_ENDPOINT}?${this.buildQuery(cfg, status, page)}`;
+        if (Date.now() > deadline) { console.warn('list soft-deadline reached'); hitLimit = true; break; }
+        const url = `${CFG.API_BASE}${CFG.INV_ENDPOINT}?${this.buildQuery(cfg, status, page, fetched)}`;
         const r = UrlFetchApp.fetch(url, { method: 'get', headers: this.headers(cfg.token), muteHttpExceptions: true });
         const code = r.getResponseCode();
         if (code === 401 || code === 403) throw new AuthError(code);
         if (code !== 200) { console.warn(`page ${page} status ${status} → HTTP ${code}`); break; }
-        let raw = [], total = 0;
-        try { const j = JSON.parse(r.getContentText()); const d = j.data || {}; raw = Array.isArray(d.raw) ? d.raw : []; total = d.total || 0; }
+        let raw = [];
+        try { const j = JSON.parse(r.getContentText()); const d = j.data || {}; raw = Array.isArray(d.raw) ? d.raw : []; }
         catch(e){ console.warn('parse failed: ' + e); break; }
-        raw.forEach(i => rows.push(parseInvoice_(i, status)));
-        if (raw.length < CFG.INV_LIMIT) break;
-        if (total && page * CFG.INV_LIMIT >= total) break;
+        if (!raw.length) break;                     // ← real stop: no more data
+        let added = 0;
+        raw.forEach(i => {
+          const rec = parseInvoice_(i, status);
+          const key = String(rec.invoiceId || '');
+          if (key && seen.has(key)) return;         // dedup / repeated-page guard
+          if (key) seen.add(key);
+          rows.push(rec); added++;
+        });
+        fetched += raw.length;
+        if (added === 0) { if (++stall >= 2) break; } else stall = 0;   // pagination not advancing
+        if (rows.length >= CFG.MAX_ROWS) { console.warn('MAX_ROWS reached'); hitLimit = true; break; }
       }
+      if (hitLimit) break;
     }
-    console.log('invoices fetched: ' + rows.length);
+    console.log('invoices fetched: ' + rows.length + (hitLimit ? ' (partial — run again)' : ''));
+    rows.__partial = hitLimit;
     return rows;
   },
 
@@ -233,7 +262,7 @@ function parseInvoice_(i, queriedStatus) {
     invoiceId: pick_(i, CFG.F_INVOICE_ID) || null,
     amount:    pick_(i, CFG.F_AMOUNT),
     type:      pick_(i, CFG.F_TYPE),
-    supplier:  pick_(i, CFG.F_SUPPLIER),
+    supplier:  pick_(i, CFG.F_SUPPLIER) || deepFindName_(i, new RegExp(CFG.SUPPLIER_KEY_RE, 'i'), 0),
     location:  pick_(i, CFG.F_LOCATION) || 'غير محدد',
     spendAt:   pick_(i, CFG.F_SPEND_AT),
     dueAt:     pick_(i, CFG.F_DUE_AT),
@@ -263,6 +292,21 @@ function deepFindPlate_(obj, depth) {
   const keys = Object.keys(obj);
   if (keys.some(k => /plate|لوحة/i.test(k))) { const p = plateFromCar_(obj); if (p) return p; }
   for (const k of keys) { const v = obj[k]; if (v && typeof v === 'object') { const p = deepFindPlate_(v, depth + 1); if (p) return p; } }
+  return '';
+}
+
+/** Find a value under a key matching `re`: prefer a nested {name}; accept a
+ *  non-numeric string. Skips numeric ids (e.g. paymentMethodId). */
+function deepFindName_(obj, re, depth) {
+  if (!obj || typeof obj !== 'object' || (depth || 0) > 5) return '';
+  for (const k of Object.keys(obj)) {
+    if (re.test(k)) {
+      const v = obj[k];
+      if (v && typeof v === 'object' && v.name) return String(v.name);
+      if (typeof v === 'string' && v.trim() && !/^\d+$/.test(v.trim())) return v.trim();
+    }
+  }
+  for (const k of Object.keys(obj)) { const v = obj[k]; if (v && typeof v === 'object') { const r = deepFindName_(v, re, (depth || 0) + 1); if (r) return r; } }
   return '';
 }
 
@@ -349,6 +393,7 @@ function syncDisbursementData() {
 
     // 1) fetch + client-side name filters (location/supplier)
     let invoices = Api.fetchAllInvoices(cfg);
+    const partial = invoices.__partial === true;
     const locNorm = Util.norm(cfg.location), supNorm = Util.norm(cfg.supplier);
     invoices = invoices.filter(inv => {
       if (locNorm && !cfg.locationIds) { const n = Util.norm(inv.location); if (n.indexOf(locNorm) === -1 && locNorm.indexOf(n) === -1) return false; }
@@ -384,7 +429,9 @@ function syncDisbursementData() {
 
     const pending = data.rows.filter(r => !String(r[DI.PLATE] || '').trim()).length;
     const secs = Math.round((Date.now() - t0) / 1000);
-    notify_(`تم في ${secs}ث · فواتير ${data.rows.length}` + (pending ? ` · لوحات ناقصة ${pending} (شغّل «إكمال جلب اللوحات»)` : ' · كل اللوحات مكتملة'));
+    notify_(`تم في ${secs}ث · فواتير ${data.rows.length}` +
+            (partial ? ' · (قائمة جزئية — أعد التشغيل لجلب الباقي)' : '') +
+            (pending ? ` · لوحات ناقصة ${pending} (شغّل «إكمال جلب اللوحات»)` : ' · اللوحات مكتملة'));
   } catch (e) {
     if (e instanceof AuthError) notify_('انتهت صلاحية التوكن (HTTP ' + e.code + '). جدّد التوكن.');
     else { notify_('خطأ: ' + e.message); console.error(e.stack || e); }
@@ -438,12 +485,60 @@ function syncTick() {
   if (pending > 0) enrichPlatesRun(); else syncDisbursementData();
 }
 
+/* ════════════════════════════ DEBUG: dump one raw item's field names ════════════════════════════
+ * When a column comes out empty (e.g. «مورد الصرف»), run this to see the ACTUAL
+ * JSON keys of one cost-invoice item + one order detail, so the field mapping can
+ * be pinned exactly. Writes to a «Debug» sheet. */
+function flatten_(obj, prefix, out, depth) {
+  out = out || {}; prefix = prefix || ''; depth = depth || 0;
+  if (obj == null || depth > 4) { if (prefix) out[prefix] = obj; return out; }
+  if (typeof obj !== 'object') { out[prefix] = obj; return out; }
+  if (Array.isArray(obj)) { out[prefix] = '[array ' + obj.length + ']'; if (obj[0] && typeof obj[0] === 'object') flatten_(obj[0], prefix + '[0]', out, depth + 1); return out; }
+  Object.keys(obj).forEach(k => { const p = prefix ? prefix + '.' + k : k; const v = obj[k]; if (v && typeof v === 'object') flatten_(v, p, out, depth + 1); else out[p] = v; });
+  return out;
+}
+
+function debugSample() {
+  const cfg = getConfig_();
+  if (!cfg.token || cfg.token.length < 30) { alertSafe_('احفظ التوكن أولًا.'); return; }
+  const url = `${CFG.API_BASE}${CFG.INV_ENDPOINT}?${Api.buildQuery(cfg, (cfg.statuses[0] || null), 1, 0)}`;
+  const r = UrlFetchApp.fetch(url, { method: 'get', headers: Api.headers(cfg.token), muteHttpExceptions: true });
+  let item = null; let orderId = null;
+  try { const d = (JSON.parse(r.getContentText()).data) || {}; item = (d.raw || [])[0] || null; } catch (e) {}
+  if (!item) { alertSafe_('لا توجد فاتورة في هذه الفلاتر لعرض عيّنة. وسّع النطاق ثم أعد المحاولة.'); return; }
+  orderId = pick_(item, CFG.F_ORDER_ID);
+
+  const invFlat = flatten_(item, '', {}, 0);
+  let ordFlat = {};
+  if (orderId) {
+    try {
+      const or = UrlFetchApp.fetch(`${CFG.API_BASE}${CFG.ORDER_ENDPOINT}${orderId}`, { method: 'get', headers: Api.headers(cfg.token), muteHttpExceptions: true });
+      const od = (JSON.parse(or.getContentText()).orderDetails) || {};
+      ordFlat = flatten_(od, '', {}, 0);
+    } catch (e) {}
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Debug') || ss.insertSheet('Debug');
+  sh.clearContents(); sh.clearFormats();
+  const rows = [['— cost-invoice item —', '']];
+  Object.keys(invFlat).sort().forEach(k => rows.push([k, String(invFlat[k])]));
+  rows.push(['', '']); rows.push([`— order ${orderId} detail —`, '']);
+  Object.keys(ordFlat).sort().forEach(k => rows.push([k, String(ordFlat[k])]));
+  sh.getRange(1, 1, 1, 2).setValues([['حقل (path)', 'قيمة']]).setBackground('#0d1b2a').setFontColor('#fff').setFontWeight('bold');
+  sh.getRange(2, 1, rows.length, 2).setNumberFormat('@').setValues(rows.map(r => r.map(Util.safeText)));
+  sh.setColumnWidth(1, 360); sh.setColumnWidth(2, 480); sh.setFrozenRows(1);
+  SpreadsheetApp.setActiveSheet(sh);
+  alertSafe_('تم إنشاء تبويب «Debug» بأسماء الحقول الفعلية.\nابحث فيه عن قيمة «مورد الصرف» وأرسل لي اسم الحقل (path)، أو أرسل لي التبويب.');
+}
+
 /* ════════════════════════════ MENU / TRIGGERS / SETUP ════════════════════════════ */
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('بيانات الصرف')
     .addItem('▶ سحب / تحديث البيانات', 'syncDisbursementData')
     .addItem('🚗 إكمال جلب اللوحات', 'enrichPlatesRun')
     .addSeparator()
+    .addItem('🔍 فحص عيّنة (Debug)', 'debugSample')
     .addItem('🔐 حفظ التوكن (آمن)', 'setToken')
     .addItem('⚙ إعداد الشيت أول مرة', 'initSheets')
     .addItem('⏰ تفعيل التحديث التلقائي (كل 10 دقائق)', 'setupTriggers')
